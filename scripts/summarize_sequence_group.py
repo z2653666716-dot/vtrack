@@ -81,6 +81,7 @@ def build_group_report(reports: list[dict]) -> dict:
             "occluded_frames_with_binding", "timed_frames", "successful_reentry_events",
             "evaluable_reentry_events", "actual_template_updates", "eligible_opportunities",
         )}
+        registered_videos = failed_registration_videos = 0
         processing_weighted_sum = 0.0
         processing_sample_count = 0
         quality_values = []
@@ -89,9 +90,15 @@ def build_group_report(reports: list[dict]) -> dict:
             entry = report["variants"][variant]
             metrics = entry["summary"]
             updates = entry.get("body_template_updates", {})
+            registration = entry.get("registration") or {}
+            registration_status = registration.get("status", "not_recorded")
+            registered_videos += registration_status == "registered"
+            failed_registration_videos += registration_status == "failed"
             row = {
                 "video_id": report["video_id"],
                 "video_sha256": report["video_sha256"],
+                "registration_status": registration_status,
+                "registration_reason": registration.get("reason"),
                 "visible_frames": metrics["visible_frames"],
                 "correct_binding_frames": metrics["correct_binding_frames"],
                 "visible_correct_binding_ratio": metrics["visible_correct_binding_ratio"],
@@ -124,6 +131,13 @@ def build_group_report(reports: list[dict]) -> dict:
         valid_coverages = [finite_number(row["visible_correct_binding_ratio"])
                            for row in video_metrics if row["visible_frames"] > 0]
         valid_coverages = [value for value in valid_coverages if value is not None]
+        registered_rows = [row for row in video_metrics
+                           if row["registration_status"] == "registered" and row["visible_frames"] > 0]
+        registered_coverages = [finite_number(row["visible_correct_binding_ratio"])
+                                for row in registered_rows]
+        registered_coverages = [value for value in registered_coverages if value is not None]
+        registered_visible = sum(row["visible_frames"] for row in registered_rows)
+        registered_correct = sum(row["correct_binding_frames"] for row in registered_rows)
         variants[variant] = {
             **totals,
             "visible_correct_binding_ratio_frame_weighted": ratio(
@@ -134,6 +148,15 @@ def build_group_report(reports: list[dict]) -> dict:
                 processing_weighted_sum / processing_sample_count if processing_sample_count else None),
             "processing_sample_count": processing_sample_count,
             "videos_with_visible_samples": len(valid_coverages),
+            # 同时单列已登记成功子集，帮助区分身份更新策略与目标登记失败的影响。
+            "registered_only_videos": len(registered_rows),
+            "registered_only_visible_frames": registered_visible,
+            "registered_only_correct_binding_frames": registered_correct,
+            "registered_only_coverage_frame_weighted": ratio(registered_correct, registered_visible),
+            "registered_only_coverage_video_macro": mean(registered_coverages) if registered_coverages else None,
+            "registration_success_videos": registered_videos,
+            "registration_failed_videos": failed_registration_videos,
+            "registration_status_recorded_videos": registered_videos + failed_registration_videos,
             "quality_median_across_video_medians": mean(quality_values) if quality_values else None,
             "alpha_median_across_video_medians": mean(alpha_values) if alpha_values else None,
         }
@@ -171,24 +194,28 @@ def write_outputs(report: dict, output_dir: Path) -> None:
         f"视频数：{report['video_count']}。结果状态：探索性汇总，不代表统计显著或普遍泛化。", "",
         "帧加权覆盖率 = 汇总正确绑定帧 / 汇总可见目标帧；视频等权覆盖率为每条有可见帧的视频覆盖率的算术平均。",
         "相邻视频帧高度相关，因此帧数不是独立样本数。处理耗时是离线单帧后端统计，不代表端到端延迟或手机 FPS。", "",
-        "| 方案 | 视频数 | 可见帧 | 正确绑定帧 | 帧加权覆盖率 | 视频等权覆盖率 | 错绑帧 | 未绑定帧 | 实际模板写入 | 平均处理耗时(ms) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 方案 | 视频数 | 登记成功/失败 | 全集帧加权覆盖率 | 登记成功子集覆盖率 | 子集视频数 | 全集视频等权覆盖率 | 错绑帧 | 未绑定帧 | 实际模板写入 | 平均处理耗时(ms) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for variant, metrics in report["variants"].items():
         frame_ratio = metrics["visible_correct_binding_ratio_frame_weighted"]
         macro_ratio = metrics["visible_correct_binding_ratio_video_macro"]
+        registered_ratio = metrics["registered_only_coverage_frame_weighted"]
         lines.append(
-            f"| {variant} | {metrics['videos_with_visible_samples']} | {metrics['visible_frames']} "
-            f"| {metrics['correct_binding_frames']} | {frame_ratio:.2%} "
-            f"| {macro_ratio:.2%} | {metrics['wrong_person_frames']} "
+            f"| {variant} | {metrics['videos_with_visible_samples']} "
+            f"| {metrics['registration_success_videos']}/{metrics['registration_failed_videos']} "
+            f"| {frame_ratio:.2%} | {registered_ratio:.2%} "
+            f"| {metrics['registered_only_videos']} | {macro_ratio:.2%} | {metrics['wrong_person_frames']} "
             f"| {metrics['visible_unbound_frames']} | {metrics['actual_template_updates']} "
             f"| {metrics['mean_processing_ms_frame_weighted']:.2f} |"
         )
     lines.extend(["", "## 各视频结果", "",
-                  "| 视频 | 方案 | 可见帧 | 正确绑定 | 覆盖率 | 错绑 | 未绑定 | 模板写入 |", "|---|---|---:|---:|---:|---:|---:|---:|"])
+                  "| 视频 | 方案 | 登记 | 登记原因 | 可见帧 | 正确绑定 | 覆盖率 | 错绑 | 未绑定 | 模板写入 |",
+                  "|---|---|---|---|---:|---:|---:|---:|---:|---:|"])
     for row in report["per_video"]:
         lines.append(
-            f"| {row['video_id']} | {row['variant']} | {row['visible_frames']} "
+            f"| {row['video_id']} | {row['variant']} | {row['registration_status']} "
+            f"| {row['registration_reason'] or '—'} | {row['visible_frames']} "
             f"| {row['correct_binding_frames']} | {row['visible_correct_binding_ratio']:.2%} "
             f"| {row['wrong_person_frames']} | {row['visible_unbound_frames']} "
             f"| {row['actual_template_updates']} |"

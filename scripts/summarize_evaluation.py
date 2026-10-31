@@ -476,6 +476,8 @@ def main() -> int:
                 "summary": scored["summary"],
                 "reentry_events": scored["reentry_events"],
                 "run": item["payload"]["run"],
+                # 登记失败时覆盖率仍按端到端结果计入，但必须保留失败原因供分组报告解释。
+                "registration": item["payload"].get("registration"),
                 "prediction_file": Path(item["path"]).name,
             }
             all_frames.extend(scored["frame_rows"])

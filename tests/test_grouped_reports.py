@@ -11,6 +11,7 @@ def make_video(video_id: str, visible: int, correct: int) -> dict:
         "annotation_sha256": f"annotation-{video_id}",
         "variants": {
             name: {
+                "registration": {"status": "registered", "reason": None},
                 "summary": {
                     "visible_frames": visible,
                     "correct_binding_frames": correct,
@@ -48,6 +49,7 @@ def test_group_summary_separates_frame_weighted_and_video_macro_rates():
     assert metrics["correct_binding_frames"] == 95
     assert metrics["visible_correct_binding_ratio_frame_weighted"] == 0.95
     assert metrics["visible_correct_binding_ratio_video_macro"] == 0.75
+    assert metrics["registered_only_coverage_frame_weighted"] == 0.95
     assert metrics["actual_template_updates"] == 2
 
 
@@ -63,3 +65,19 @@ def test_group_summary_keeps_missing_video_score_as_none():
     assert metrics["visible_correct_binding_ratio_frame_weighted"] == 0.5
     assert metrics["visible_correct_binding_ratio_video_macro"] == 0.5
     assert metrics["videos_with_visible_samples"] == 1
+
+
+def test_group_summary_counts_registration_failures_separately():
+    """目标登记失败仍进入端到端覆盖率，同时报告成功和失败序列数。"""
+    failed = make_video("failed", visible=5, correct=0)
+    failed["variants"]["hybrid_b0"]["registration"] = {
+        "status": "failed", "reason": "no_unique_detection_match",
+    }
+    report = build_group_report([failed, make_video("ok", visible=5, correct=4)])
+    metrics = report["variants"]["hybrid_b0"]
+    assert metrics["registration_success_videos"] == 1
+    assert metrics["registration_failed_videos"] == 1
+    assert metrics["registered_only_visible_frames"] == 5
+    assert metrics["registered_only_coverage_frame_weighted"] == 0.8
+    row = next(item for item in report["per_video"] if item["video_id"] == "failed")
+    assert row["registration_reason"] == "no_unique_detection_match"

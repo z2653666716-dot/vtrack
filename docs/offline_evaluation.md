@@ -137,6 +137,6 @@ foreach ($variant in @("hybrid_b0", "hybrid_b1", "hybrid_b2")) {
   --output-dir "outputs\evaluation\quality_template\MOT17-$sequence\report"
 ```
 
-逐视频报告包含 JSON、CSV 和 Markdown。把至少两条完整视频的 `evaluation_summary.json` 传给 `scripts/summarize_sequence_group.py --reports ... --output-dir ...`，可再生成多视频 JSON、CSV、Markdown。汇总同时给出帧加权与视频等权覆盖率：前者回答所有已评帧中有多少正确绑定，后者避免较长序列独占总结果。相邻帧高度相关，推断样本量时仍以完整视频数为准，不报告统计显著性。
+逐视频报告包含 JSON、CSV 和 Markdown。把至少两条完整视频的 `evaluation_summary.json` 传给 `scripts/summarize_sequence_group.py --reports ... --output-dir ...`，可再生成多视频 JSON、CSV、Markdown。汇总同时给出全量尝试的帧加权与视频等权覆盖率，以及登记成功子集的覆盖率和登记成功/失败数：全量结果反映端到端流程，登记成功子集更适合分析后续身份更新策略。相邻帧高度相关，推断样本量时仍以完整视频数为准，不报告统计显著性。
 
 保留集应原样报告所有运行结果，包括登记失败、未绑定和错绑。若要继续开发，先把保留集降级为开发数据，不能继续把同一组视频称作未见测试。处理耗时是电脑离线端单帧后端耗时，不代表手机 FPS 或端到端延迟。MOT17 标签文件提供训练集真值；公开榜单上的 MOT17 test split 没有公开 GT，不能用其可视化视频估算身份准确率。

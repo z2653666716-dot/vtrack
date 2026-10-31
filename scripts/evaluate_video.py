@@ -1,7 +1,7 @@
 """在指定本地视频上运行 ViTrack 离线算法回放。
 
 程序通过文件路径读取视频，不接受摄像头编号或网络流；每次运行创建新会话，
-按人工标注中的同一帧登记目标，调用现有 Pipeline、Tracker 与身份模块，逐帧输出
+可使用人工标注登记目标，也可在单人视频中自动选择首个稳定人物轨迹，调用现有 Pipeline、Tracker 与身份模块，逐帧输出
 数值框、绑定状态和真实处理耗时。它不会生成带框视频、截图、裁剪或特征文件。
 """
 
@@ -63,21 +63,21 @@ def parse_args() -> argparse.Namespace:
     """读取显式视频、标注、算法方案和结果路径；拒绝视频以外的输入。"""
     parser = argparse.ArgumentParser(description="在指定本地视频上运行单方案的 ViTrack 离线回放")
     parser.add_argument("--video", required=True, type=Path, help="本地视频文件路径，不支持摄像头或网络流")
-    parser.add_argument("--annotations", required=True, type=Path, help="审阅界面导出的人工标注 JSON")
+    parser.add_argument("--annotations", type=Path, help="可选：审阅界面导出的人工评测标注；省略时按单人模式自动登记首个稳定人物轨迹")
     parser.add_argument("--variant", required=True, choices=VARIANTS, help="bytetrack、body 或 hybrid")
     parser.add_argument("--output", type=Path, help="预测 JSON 输出路径")
     parser.add_argument("--device", choices=("cpu", "0"), help="覆盖检测设备；默认使用项目 .env 配置")
     args = parser.parse_args()
 
     args.video = args.video.expanduser().resolve()
-    args.annotations = args.annotations.expanduser().resolve()
+    args.annotations = args.annotations.expanduser().resolve() if args.annotations else None
     if not args.video.is_file() or args.video.suffix.lower() not in VIDEO_SUFFIXES:
         parser.error("--video 必须指向现存的本地视频文件（MP4/MOV/AVI/MKV/WebM/M4V）")
-    if not args.annotations.is_file() or args.annotations.suffix.lower() != ".json":
+    if args.annotations and (not args.annotations.is_file() or args.annotations.suffix.lower() != ".json"):
         parser.error("--annotations 必须指向现存的 JSON 标注文件")
     args.output = (args.output.expanduser().resolve() if args.output else
                    ROOT / "outputs" / "evaluation" / f"{args.video.stem}_{args.variant}_predictions.json")
-    if args.output in {args.video, args.annotations}:
+    if args.output == args.video or (args.annotations and args.output == args.annotations):
         parser.error("--output 不能覆盖视频或人工标注文件")
     return args
 
@@ -143,6 +143,48 @@ def load_annotations(path: Path, video_path: Path) -> tuple[dict, dict[int, dict
     if target_id not in {person["person_id"] for person in annotations[registration_frame]["people"]}:
         raise ValueError("目标登记帧中没有登记目标的人物框")
     return payload, annotations
+
+
+def build_single_person_metadata(video_path: Path) -> dict:
+    """为无需人工真值框的单人回放建立视频元数据与自动登记模式。
+
+    输入是已由命令行明确指定的本地视频；输出仅含 SHA-256、帧率、帧数和目标编号，
+    不保存视频画面。空 annotations 表示本轮只生成预测供人工复核，不计算准确率。
+    """
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError("无法解码指定本地视频")
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    capture.release()
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 30.0
+    digest = sha256_file(video_path)
+    return {
+        "schema_version": 1,
+        "video": {"id": digest[:12], "sha256": digest, "fps": fps,
+                  "frame_count": frame_count, "width": width, "height": height},
+        "target_person_id": "person-1",
+        "registration": None,
+        "registration_mode": "single_person_first_stable_track",
+        "annotations": [],
+        "reentry_events": [],
+    }
+
+
+def select_initialization_box(boxes: list[Box]) -> Box | None:
+    """从当前人物检测中选择单人模式的初始化候选框。
+
+    优先取已有稳定 track_id 的框；如果跟踪器尚未分配编号，则暂取置信度最高的框，
+    后续帧会用框重合度接上轨迹。空输入返回 None。
+    """
+    if not boxes:
+        return None
+    tracked_boxes = [box for box in boxes if box.track_id is not None]
+    return max(tracked_boxes or boxes, key=lambda box: box.score)
 
 
 def make_config(base: AppConfig, variant: str, device: str | None) -> AppConfig:
@@ -234,7 +276,7 @@ def box_record(box: Box, target_track_id: int | None, tracker_only: bool,
 
 async def run_replay(args: argparse.Namespace, annotation_file: dict, annotations: dict[int, dict],
                      config: AppConfig, detector: Detector) -> dict:
-    """逐帧运行现有 Pipeline，遇登记帧按人工目标框初始化同一个目标。"""
+    """逐帧运行现有 Pipeline；按人工框登记，或在单人模式自动初始化首个轨迹。"""
     pipeline = Pipeline(detector, config)
     clock = VideoClock()
     session: VideoSession | Tracker
@@ -252,10 +294,11 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
     if not math.isfinite(fps) or fps <= 0:
         fps = float(annotation_file["video"].get("fps") or 30.0)
     reported_frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    registration = annotation_file["registration"]
-    registration_frame = registration["frame_index"]
+    registration = annotation_file.get("registration")
+    registration_frame = registration.get("frame_index") if isinstance(registration, dict) else None
     target_id = annotation_file["target_person_id"]
     registration_status = {"status": "not_started", "frame_index": registration_frame,
+                           "mode": annotation_file.get("registration_mode", "manual_target_box"),
                            "iou_threshold": REGISTRATION_IOU, "track_id": None, "reason": None}
     locked_track_id = None
     target_identity_id = None
@@ -287,7 +330,28 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
             processing_ms = (perf_counter() - frame_started) * 1000
             output_boxes = result.boxes
 
-            if frame_index == registration_frame:
+            if registration_frame is None and registration_status["status"] == "not_started":
+                # 纯复核模式没有人工登记框；本视频确定只有一个人，因此取首个稳定人物轨迹。
+                selected = select_initialization_box(output_boxes)
+                if selected is not None:
+                    registration_status.update(frame_index=frame_index,
+                                               requested_time_seconds=timestamp,
+                                               best_score=round(selected.score, 6))
+                    if selected.track_id is None:
+                        pending_registration_box = list(selected.xyxy)
+                        registration_status.update(status="pending", reason="waiting_for_track_id",
+                                                   anchor_iou_threshold=0.3)
+                    elif isinstance(session, Tracker):
+                        locked_track_id = selected.track_id
+                        registration_status.update(status="registered", track_id=locked_track_id,
+                                                   effective_frame_index=frame_index, reason=None)
+                    else:
+                        pending_lock_track_id = selected.track_id
+                        locked_track_id = selected.track_id
+                        registration_status.update(status="pending", track_id=locked_track_id,
+                                                   reason="waiting_for_track_warmup")
+
+            if registration_frame is not None and frame_index == registration_frame:
                 registration_status["requested_time_seconds"] = timestamp
                 human_frame = annotations[registration_frame]
                 target_box = next(person["bbox_xyxy"] for person in human_frame["people"]
@@ -409,7 +473,7 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
                        "body_hold_threshold": config.body_hold_threshold,
                        "reid_confirm_frames": config.reid_confirm_frames},
             "registration_iou": REGISTRATION_IOU,
-            "annotation_sha256": sha256_file(args.annotations),
+            "annotation_sha256": sha256_file(args.annotations) if args.annotations else None,
             "visibility_inferred_from_target_boxes": annotation_file.get(
                 "_visibility_inferred_frames", 0),
             "elapsed_computation_seconds": round(perf_counter() - started_all, 3),
@@ -425,7 +489,10 @@ def main() -> int:
     """入口：校验人工标注 → 配置方案 → 加载模型 → 本地回放 → 写出数值 JSON。"""
     args = parse_args()
     try:
-        annotation_file, annotations = load_annotations(args.annotations, args.video)
+        if args.annotations:
+            annotation_file, annotations = load_annotations(args.annotations, args.video)
+        else:
+            annotation_file, annotations = build_single_person_metadata(args.video), {}
         config = make_config(load_config(), args.variant, args.device)
         detector = Detector(config)
         report = asyncio.run(run_replay(args, annotation_file, annotations, config, detector))

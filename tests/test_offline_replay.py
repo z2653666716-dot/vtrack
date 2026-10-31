@@ -1,7 +1,7 @@
 """离线回放绑定规则测试，确保重入换轨迹号后按身份而非旧轨迹号判断。"""
 
 from app.schemas import Box
-from scripts.evaluate_video import box_record
+from scripts.evaluate_video import box_record, select_initialization_box
 
 
 def _box(track_id: int, identity_id: str | None, state: str) -> Box:
@@ -33,3 +33,14 @@ def test_bytetrack_baseline_remains_bound_to_original_track_only() -> None:
 
     assert same_track["bound_to_target"] is True
     assert changed_track["bound_to_target"] is False
+
+
+def test_single_person_initialization_prefers_first_stable_track():
+    """单人无标注回放优先从已有轨迹号的检测框初始化，避免选无轨迹候选框。"""
+    untracked = Box(cls=0, name="person", score=0.99, xyxy=(0.0, 0.0, 0.4, 0.8),
+                    track_id=None, identity_id=None, state="none")
+    tracked = Box(cls=0, name="person", score=0.70, xyxy=(0.2, 0.1, 0.6, 0.9),
+                  track_id=7, identity_id=None, state="none")
+
+    assert select_initialization_box([untracked, tracked]) is tracked
+    assert select_initialization_box([]) is None

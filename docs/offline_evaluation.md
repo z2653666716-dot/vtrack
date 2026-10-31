@@ -79,25 +79,18 @@
 
 ## 运行三种方案与生成对比报告
 
-如果要做指标比较，先准备带少量目标人物框的 JSON 标注。登记时刻由最早的目标框自动确定。某些跟踪器在该帧还没有稳定轨迹号，身份会话也要求连续观测预热；回放会等待条件满足，并记录实际生效帧及等待时间。之后对同一个视频和同一份标注分别运行以下命令；每个方案都会从全新会话开始，预测只包含数值框、状态、时间和耗时：
+只为人工复核重新生成预测时，单人视频不需要标注文件。省略 `--annotations` 后，回放会从首个稳定人物轨迹自动初始化；该模式只生成预测，不计算准确率。多人视频不能用此自动选择模式。每个方案都会从新会话开始，预测只包含数值框、状态、时间和耗时：
 
 ```powershell
 $python = ".\envs\vitrack\python.exe"
 $video = "resources\你的测试视频.mp4"
-$annotations = "outputs\annotations\你的测试视频_annotations.json"
 
-& $python -X utf8 scripts/evaluate_video.py --video $video --annotations $annotations --variant bytetrack
-& $python -X utf8 scripts/evaluate_video.py --video $video --annotations $annotations --variant body
-& $python -X utf8 scripts/evaluate_video.py --video $video --annotations $annotations --variant hybrid
-
-& $python -X utf8 scripts/summarize_evaluation.py `
-  --annotations $annotations `
-  --predictions outputs\evaluation\你的测试视频_bytetrack_predictions.json `
-               outputs\evaluation\你的测试视频_body_predictions.json `
-               outputs\evaluation\你的测试视频_hybrid_predictions.json
+& $python -X utf8 scripts/evaluate_video.py --video $video --variant bytetrack
+& $python -X utf8 scripts/evaluate_video.py --video $video --variant body
+& $python -X utf8 scripts/evaluate_video.py --video $video --variant hybrid
 ```
 
-审阅时可依次将每个预测 JSON 载入界面核对暂停帧和备注。汇总器要求三份预测使用相同视频、相同人工标注摘要、相同检测权重/尺寸/阈值/设备和身份推理设备；不同跟踪与身份算法本身是比较变量。默认 IoU 0.5 为主结果，同时固定输出 0.3 与 0.7 的门槛敏感性检查。报告保存在 `outputs/evaluation/<video-id>/`，包括 `evaluation_summary.json`、`.csv`、`.md`、`frame_results.csv`、`failure_cases.csv`、`scene_summary.csv` 和 `iou_sensitivity.csv`。
+审阅时可依次将每个预测 JSON 载入界面核对暂停帧和备注。上述自动初始化预测没有人工真值，不能直接交给汇总器计算准确率。要生成定量报告，先导出带人物框的人工 JSON，再为三个方案分别增加 `--annotations $annotations` 重跑；之后才运行汇总器。汇总器要求三份预测使用相同视频、相同人工标注摘要、相同检测权重/尺寸/阈值/设备和身份推理设备；不同跟踪与身份算法本身是比较变量。默认 IoU 0.5 为主结果，同时固定输出 0.3 与 0.7 的门槛敏感性检查。
 
 ## 结果解释边界
 

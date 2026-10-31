@@ -2,7 +2,7 @@
 
 本脚本使用 Tkinter 显示用户通过文件选择器指定的视频，只在本机内存解码。
 审阅者可暂停、逐帧跳转、为人物画框、加载算法预测叠加层、标记场景并写文字备注，最后
-导出不包含视频帧、截图、裁剪或特征的 JSON 标注，供离线回放与报告程序使用。
+分别导出供算法分析的问题备注，或供定量评测使用的人工人物框；两种导出互不阻塞。
 脚本不打开摄像头、不启动网络服务，也不把视频上传或复制到其他位置。
 """
 
@@ -24,6 +24,54 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 CANVAS_WIDTH = 960
 CANVAS_HEIGHT = 540
 SCENE_LABELS = ("unspecified", "far_to_near", "reentry", "back_turn", "multi_person", "other")
+ISSUE_LABELS = ("其他", "漏检", "检测到但未绑定", "身份认错",
+                "轨迹编号变化", "框抖动", "身份丢失")
+ISSUE_CODES = dict(zip(ISSUE_LABELS, ("other", "missed_detection", "unbound_target",
+                                     "wrong_identity", "track_id_changed", "box_jitter",
+                                     "identity_lost")))
+ISSUE_NAMES = {code: label for label, code in ISSUE_CODES.items()}
+
+
+def choose_automatic_registration(annotations: dict[int, dict], target_person_id: str) -> dict | None:
+    """用最早一帧人工目标框自动确定可重复的评测初始化时刻。
+
+    输入是按帧号存放的人工框记录和目标编号；找到目标框时返回该帧记录，
+    找不到时返回 None。这个时刻只用于公平重放，不让复核备注依赖人工登记操作。
+    """
+    candidates = [row for row in annotations.values()
+                  if any(person.get("person_id") == target_person_id
+                         for person in row.get("people", []))]
+    return min(candidates, key=lambda row: row["frame_index"]) if candidates else None
+
+
+def build_review_notes_payload(video: dict, prediction: dict | None,
+                               annotations: dict[int, dict]) -> dict:
+    """整理供算法问题分析的纯文字复核记录。
+
+    输入为视频摘要、可选方案信息和按帧保存的表单内容；输出仅包含帧号、时间、
+    问题类别与文字，不含人工人物框或任何图像/特征数据。
+    """
+    notes = []
+    for frame_index in sorted(annotations):
+        row = annotations[frame_index]
+        note = str(row.get("review_note", "")).strip()
+        if not note:
+            continue
+        notes.append({
+            "frame_index": frame_index,
+            "video_time_seconds": row.get("video_time_seconds"),
+            "issue_type": row.get("issue_type", "other"),
+            "note": note,
+        })
+    return {
+        "schema_version": 1,
+        "kind": "algorithm_review_notes",
+        "video": video,
+        "prediction": prediction,
+        "notes": notes,
+        "privacy": {"frames_exported": False, "boxes_exported": False,
+                    "features_exported": False},
+    }
 
 
 class VideoReviewApp:
@@ -45,6 +93,7 @@ class VideoReviewApp:
         self.video_sha256: str | None = None
         self.predictions: dict[int, dict] = {}
         self.prediction_path: Path | None = None
+        self.prediction_variant: str | None = None
         self.fps = 0.0
         self.frame_count = 0
         self.frame_index = 0
@@ -54,7 +103,6 @@ class VideoReviewApp:
         self.image_rect = (0, 0, 1, 1)
         self.annotations: dict[int, dict] = {}
         self.target_person_id = "person-1"
-        self.registration = None
         self.reentry_start = None
         self.reentry_events = []
         self.drag_start = None
@@ -66,6 +114,7 @@ class VideoReviewApp:
         self.person_id_var = tk.StringVar(value="person-1")
         self.is_target_var = tk.BooleanVar(value=True)
         self.note_var = tk.StringVar()
+        self.issue_var = tk.StringVar(value="其他")
         self.position_var = tk.StringVar(value="尚未打开视频")
 
         self._build_layout()
@@ -81,6 +130,7 @@ class VideoReviewApp:
         ttk.Button(toolbar, text="打开本地视频", command=self.open_video).pack(side="left")
         ttk.Button(toolbar, text="加载方案预测", command=self.open_predictions).pack(side="left", padx=8)
         ttk.Button(toolbar, text="导出 JSON 标注", command=self.export_annotations).pack(side="left", padx=8)
+        ttk.Button(toolbar, text="导出问题复核", command=self.export_review_notes).pack(side="left", padx=8)
         ttk.Label(toolbar, textvariable=self.position_var).pack(side="left", padx=14)
 
         content = ttk.Frame(self.root, padding=(8, 0, 8, 8))
@@ -96,7 +146,8 @@ class VideoReviewApp:
         side = ttk.Frame(content, width=300, padding=(12, 4))
         side.pack(side="right", fill="y")
         side.pack_propagate(False)
-        ttk.Label(side, text="逐帧人工标注", font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(side, text="可选定量标注（仅算指标时使用）",
+                  font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
         ttk.Label(side, text="目标可见状态").pack(anchor="w", pady=(14, 2))
         ttk.Combobox(side, textvariable=self.visibility_var, state="readonly",
                      values=("visible", "absent", "unknown")).pack(fill="x")
@@ -114,10 +165,18 @@ class VideoReviewApp:
         self.people_list = tk.Listbox(side, height=6, exportselection=False)
         self.people_list.pack(fill="x", pady=(6, 10))
 
-        ttk.Label(side, text="问题备注").pack(anchor="w", pady=(4, 2))
+        ttk.Label(side, text="问题复核（无需画框或登记）",
+                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(10, 2))
+        ttk.Label(side, text="暂停后选问题类型并写现象，导出问题复核即可交给助手分析。",
+                  justify="left", foreground="#555", wraplength=270).pack(anchor="w", pady=(0, 4))
+        ttk.Label(side, text="问题类型").pack(anchor="w", pady=(4, 2))
+        ttk.Combobox(side, textvariable=self.issue_var, state="readonly",
+                     values=ISSUE_LABELS).pack(fill="x")
+        ttk.Label(side, text="问题备注").pack(anchor="w", pady=(6, 2))
         ttk.Entry(side, textvariable=self.note_var).pack(fill="x")
         ttk.Button(side, text="保存当前帧标注", command=self.save_current_annotation).pack(fill="x", pady=(8, 4))
-        ttk.Button(side, text="标记目标登记帧", command=self.mark_registration).pack(fill="x", pady=3)
+        ttk.Label(side, text="完整评测时，登记帧由最早的目标人物框自动确定。",
+                  justify="left", foreground="#555", wraplength=270).pack(anchor="w", pady=3)
         ttk.Button(side, text="标记重入起点 / 结束", command=self.mark_reentry).pack(fill="x", pady=3)
         ttk.Label(side, text="重入按钮：第一次记录目标重现起点，\n再次按下记录观察结束时刻。",
                   justify="left", foreground="#555").pack(anchor="w", pady=(2, 8))
@@ -162,7 +221,6 @@ class VideoReviewApp:
         self.frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         self.frame_index = 0
         self.annotations.clear()
-        self.registration = None
         self.reentry_start = None
         self.reentry_events.clear()
         self.target_person_id = "person-1"
@@ -171,6 +229,7 @@ class VideoReviewApp:
         self.video_sha256 = self._file_sha256(path)
         self.predictions.clear()
         self.prediction_path = None
+        self.prediction_variant = None
         ok, frame = capture.read()
         if not ok:
             self._release_capture()
@@ -215,6 +274,7 @@ class VideoReviewApp:
             return
         self.predictions = indexed
         self.prediction_path = path
+        self.prediction_variant = str(payload.get("variant", "unknown"))
         self._render_frame()
         messagebox.showinfo("预测已加载", f"方案：{payload.get('variant', 'unknown')}；"
                             f"包含 {len(indexed)} 帧预测。播放或逐帧查看时会叠加预测框。")
@@ -420,6 +480,7 @@ class VideoReviewApp:
             "scene": "unspecified",
             "people": [],
             "review_note": "",
+            "issue_type": "other",
         }
 
     def _store_current_fields(self, force: bool = False) -> None:
@@ -441,6 +502,7 @@ class VideoReviewApp:
         annotation["target_visibility"] = self.visibility_var.get()
         annotation["scene"] = self.scene_var.get()
         annotation["review_note"] = self.note_var.get().strip()
+        annotation["issue_type"] = ISSUE_CODES.get(self.issue_var.get(), "other")
 
     def save_current_annotation(self, silent: bool = False) -> None:
         """保存当前帧的状态和文字备注；silent=True 供播放/跳转时自动保留编辑。"""
@@ -457,6 +519,8 @@ class VideoReviewApp:
         self.visibility_var.set(annotation["target_visibility"] if annotation else "unknown")
         self.scene_var.set(annotation.get("scene", "unspecified") if annotation else "unspecified")
         self.note_var.set(annotation["review_note"] if annotation else "")
+        code = annotation.get("issue_type", "other") if annotation else "other"
+        self.issue_var.set(ISSUE_NAMES.get(code, ISSUE_LABELS[0]))
         self._refresh_people_list()
 
     def _refresh_people_list(self) -> None:
@@ -482,22 +546,37 @@ class VideoReviewApp:
         self._refresh_people_list()
         self._render_frame()
 
-    def mark_registration(self) -> None:
-        """记录用户指定的目标登记帧和人工目标编号，供不同算法从同一点初始化。"""
-        self._store_current_fields()
-        target = self.person_id_var.get().strip()
-        annotation = self.annotations.get(self.frame_index)
-        if not target or not annotation or not any(person["person_id"] == target for person in annotation["people"]):
-            messagebox.showwarning("登记帧缺少目标框", "请先在当前帧画出目标人物框，并填写相同的人物编号。")
+    def export_review_notes(self) -> None:
+        """单独导出问题帧和文字备注，不要求人物框、可见性或登记帧。"""
+        if self.video_path is None or self.video_sha256 is None:
+            messagebox.showwarning("尚未打开视频", "请先打开本机上的测试视频。")
             return
-        self.target_person_id = target
-        self.registration = {
-            "frame_index": self.frame_index,
-            "video_time_seconds": round(self.video_time_seconds, 6),
-            "person_id": target,
-        }
-        self._refresh_people_list()
-        messagebox.showinfo("登记帧已记录", f"所有算法将从第 {self.frame_index} 帧登记 {target}。")
+        self._store_current_fields()
+        video = {"id": self.video_sha256[:12], "sha256": self.video_sha256,
+                 "fps": self.fps, "frame_count": self.frame_count}
+        prediction = None
+        if self.prediction_path is not None:
+            prediction = {"file_name": self.prediction_path.name,
+                          "variant": self.prediction_variant or "unknown"}
+        payload = build_review_notes_payload(video, prediction, self.annotations)
+        if not payload["notes"]:
+            messagebox.showinfo("没有复核备注", "先暂停在有问题的帧，填写备注并保存当前帧。")
+            return
+        output_name = filedialog.asksaveasfilename(
+            title="导出问题复核记录（不含画面和人物框）",
+            initialdir=str(PROJECT_ROOT / "outputs" / "reviews"),
+            initialfile=f"{self.video_path.stem}_review_notes.json",
+            defaultextension=".json", filetypes=[("JSON 文件", "*.json")],
+        )
+        if not output_name:
+            return
+        output = Path(output_name).expanduser().resolve()
+        if output == self.video_path:
+            messagebox.showerror("路径冲突", "复核记录不能覆盖视频。")
+            return
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        messagebox.showinfo("问题复核已导出", f"已导出 {len(payload['notes'])} 条文字记录：\n{output}")
 
     def mark_reentry(self) -> None:
         """按下两次记录一次重入事件的起止帧，便于统计稳定恢复时间。"""
@@ -539,9 +618,12 @@ class VideoReviewApp:
             messagebox.showwarning("尚未打开视频", "请先打开本机上的测试视频。")
             return
         self._store_current_fields()
-        if self.registration is None:
-            messagebox.showwarning("缺少登记帧", "请在一帧已画出目标框的画面上点击“标记目标登记帧”。")
+        automatic_registration = choose_automatic_registration(
+            self.annotations, self.target_person_id)
+        if automatic_registration is None:
+            messagebox.showwarning("缺少目标人物框", "定量评测需要至少一帧人工确认的目标框；问题复核请用“导出问题复核”。")
             return
+        # 统一选最早的人工目标框作为各方案的初始化时刻，避免用户分别指定造成比较不公平。
         missing_target_boxes = [
             annotation["frame_index"]
             for annotation in self.annotations.values()
@@ -583,7 +665,12 @@ class VideoReviewApp:
             },
             "sampling": {"kind": "reviewed_frames", "interval_seconds": None},
             "target_person_id": self.target_person_id,
-            "registration": self.registration,
+            "registration": {
+                "frame_index": automatic_registration["frame_index"],
+                "video_time_seconds": automatic_registration["video_time_seconds"],
+                "person_id": self.target_person_id,
+                "mode": "automatic_first_target_box",
+            },
             "annotations": [self.annotations[index] for index in sorted(self.annotations)],
             "reentry_events": self.reentry_events,
             "privacy": {"video_copied": False, "frames_exported": False, "features_exported": False},

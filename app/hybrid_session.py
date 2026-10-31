@@ -43,8 +43,11 @@ class HybridObservation(Observation):
 class HybridSession(VideoSession):
     """由Pipeline串行调用；身份重入需要新证据，短时连续跟踪不再要求复现登记姿势。"""
 
-    def __init__(self, config, extractor=None, face_encoder=None, clock=None):
+    def __init__(self, config, extractor=None, face_encoder=None, clock=None,
+                 use_face_evidence=True):
         super().__init__(config, extractor, clock=clock)
+        # 消融评测可关闭人脸证据，同时保留同一身份会话、OSNet、BoT-SORT 与确认规则。
+        self.use_face_evidence = bool(use_face_evidence)
         self.face_encoder = face_encoder
         self.face_templates, self.body_valid, self.current_faces = {}, {}, {}
         self.current_body_features = {}
@@ -58,6 +61,11 @@ class HybridSession(VideoSession):
 
     def prepare_frame(self, frame, detections):
         """全帧只检测一次人脸；近距离只见脸、YOLO未给人物框时，补充明确标为person-face的观测。"""
+        if not self.use_face_evidence:
+            # 人脸消融组不调用人脸模型，也不添加仅由人脸产生的检测框。
+            self.detected_faces = []
+            self.face_only_indices = set()
+            return list(detections)
         # 搜索目标时逐帧提脸；已有连续绑定时每3帧做一次较重的人脸前向，中间不复用旧脸向量。
         bound = any(track.identity_id for track in self.observations.values() if track.last_frame == self.frame_count)
         self.detected_faces = self.face_encoder.read(frame, recognize=not bound or self.frame_count % 3 == 0)
@@ -296,14 +304,19 @@ class HybridSession(VideoSession):
         features = dict(zip([key for key, _ in crops], self.extractor.extract([crop for _, crop in crops])))
         # 只有脸的补充框不能作为全身OSNet身份依据，避免把两种输入混为一谈。
         features = {key: value for key, value in features.items() if key not in self.face_only_ids}
-        faces = self.detected_faces if self.detected_faces is not None else self.face_encoder.read(frame)
+        if self.use_face_evidence:
+            faces = self.detected_faces if self.detected_faces is not None else self.face_encoder.read(frame)
+            self.current_faces = self.face_encoder.associate(faces, all_people, frame.shape[1], frame.shape[0])
+            self.head_only_ids = set(self.face_only_ids)
+            for box in people:
+                sample = self.current_faces.get(box.track_id)
+                if sample is not None and (sample.xyxy[3] - sample.xyxy[1]) / max((box.xyxy[3] - box.xyxy[1]) * frame.shape[0], 1) > .45:
+                    self.head_only_ids.add(box.track_id)
+        else:
+            # 消融组明确清空脸部样本与脸部观测标记，避免误用上一帧数据。
+            self.current_faces = {}
+            self.head_only_ids = set()
         self.detected_faces = None
-        self.current_faces = self.face_encoder.associate(faces, all_people, frame.shape[1], frame.shape[0])
-        self.head_only_ids = set(self.face_only_ids)
-        for box in people:
-            sample = self.current_faces.get(box.track_id)
-            if sample is not None and (sample.xyxy[3] - sample.xyxy[1]) / max((box.xyxy[3] - box.xyxy[1]) * frame.shape[0], 1) > .45:
-                self.head_only_ids.add(box.track_id)
         features = {key: value for key, value in features.items() if key not in self.head_only_ids}
         self.current_body_features = features
         # 新白框或仅头部的人没有可比较的身体向量；不能因为“没分数”就宣称目标胜过了他。
@@ -416,7 +429,8 @@ class HybridSession(VideoSession):
         previous = next(iter(self.gallery.items), None)
         current = self.observations.get(track_id)
         already_bound = current is not None and current.identity_id in self.gallery.items
-        if track_id in self.head_only_ids and action != "unlock" and not already_bound:
+        if (self.use_face_evidence and track_id in self.head_only_ids
+                and action != "unlock" and not already_bound):
             sample = self.current_faces.get(track_id)
             if sample is None or sample.feature is None:
                 raise SessionError("FACE_NOT_READY", "目前只看到人脸，但质量不足，请正对镜头片刻后再锁定")
@@ -466,6 +480,8 @@ class HybridSession(VideoSession):
 
     def register_photo_frame(self, frame, detector):
         """照片登记入口：单人全身用身体+可用人脸；只有脸时允许专用人脸登记，不能多脸猜人。"""
+        if not self.use_face_evidence:
+            raise SessionError("FACE_EVIDENCE_DISABLED", "当前消融评测已关闭人脸证据，不能进行照片登记")
         height, width = frame.shape[:2]
         scale = min(1., 960 / max(height, width))
         if scale < 1:

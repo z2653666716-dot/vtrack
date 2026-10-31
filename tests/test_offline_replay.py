@@ -1,7 +1,10 @@
 """离线回放绑定规则测试，确保重入换轨迹号后按身份而非旧轨迹号判断。"""
 
+from app.config import AppConfig
+from app.hybrid_session import HybridSession
+from app.pipeline import Pipeline
 from app.schemas import Box
-from scripts.evaluate_video import box_record, select_initialization_box
+from scripts.evaluate_video import box_record, make_config, select_initialization_box
 
 
 def _box(track_id: int, identity_id: str | None, state: str) -> Box:
@@ -44,3 +47,32 @@ def test_single_person_initialization_prefers_first_stable_track():
 
     assert select_initialization_box([untracked, tracked]) is tracked
     assert select_initialization_box([]) is None
+
+
+def test_hybrid_face_ablation_changes_only_face_evidence_switch():
+    """人脸消融组与Hybrid使用相同跟踪器、OSNet和配置阈值。"""
+    base = AppConfig(det_device="cpu")
+    full = make_config(base, "hybrid", None)
+    no_face = make_config(base, "hybrid_no_face", None)
+
+    assert full == no_face
+    assert full.tracker == "botsort.yaml"
+    assert full.identity_mode == "hybrid"
+    assert full.reid_model == "osnet_x0_25"
+
+
+def test_face_disabled_hybrid_skips_face_encoder_loading():
+    """消融会话的帧准备与模型准备都不调用人脸编码器。"""
+    class EmptyExtractor:
+        person_cache = {}
+
+    base = AppConfig(det_device="cpu", identity_mode="hybrid",
+                     reid_model="osnet_x0_25", tracker="botsort.yaml")
+    pipeline = Pipeline(detector=object(), config=base)
+    pipeline.extractor = EmptyExtractor()
+    session = HybridSession(base, use_face_evidence=False)
+
+    pipeline.prepare_hybrid(session)
+    assert session.face_encoder is None
+    assert session.prepare_frame(None, []) == []
+    assert session.detected_faces == []

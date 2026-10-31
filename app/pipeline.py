@@ -75,9 +75,11 @@ class Pipeline:
         self.recommended_max_side = self.config.max_side
         self.slow_frames = 0
 
-    def create_tracker(self, clock=None) -> VideoSession:
-        """创建新视频会话；离线回放可传视频时钟，在线调用保留真实系统时钟。"""
-        session = (HybridSession(self.config, clock=clock) if self.config.identity_mode == "hybrid"
+    def create_tracker(self, clock=None, use_face_evidence=True) -> VideoSession:
+        """创建独立视频会话；离线消融可只关闭人脸证据，不改变其他会话逻辑。"""
+        session = (HybridSession(self.config, clock=clock,
+                                 use_face_evidence=use_face_evidence)
+                   if self.config.identity_mode == "hybrid"
                    else VideoSession(self.config, clock=clock))
         self.sessions[session.token] = session
         return session
@@ -86,9 +88,13 @@ class Pipeline:
         """在已有处理锁内加载一次本地行人/人脸模型，并给会话复用；不联网或访问设备。"""
         if self.extractor is None:
             self.extractor = FeatureExtractor(self.config)
-        if self.face_encoder is None:
-            self.face_encoder = FaceEncoder(self.config)
-        session.extractor, session.face_encoder = self.extractor, self.face_encoder
+        if session.use_face_evidence:
+            if self.face_encoder is None:
+                self.face_encoder = FaceEncoder(self.config)
+            session.face_encoder = self.face_encoder
+        else:
+            session.face_encoder = None
+        session.extractor = self.extractor
         self.extractor.person_cache.clear()
 
     async def session_action(self, session_id, action, *args):

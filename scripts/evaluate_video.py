@@ -35,7 +35,7 @@ from app.tracker import Tracker
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
-VARIANTS = ("bytetrack", "body", "hybrid")
+VARIANTS = ("bytetrack", "body", "hybrid_no_face", "hybrid")
 REGISTRATION_IOU = 0.5
 
 
@@ -64,7 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="在指定本地视频上运行单方案的 ViTrack 离线回放")
     parser.add_argument("--video", required=True, type=Path, help="本地视频文件路径，不支持摄像头或网络流")
     parser.add_argument("--annotations", type=Path, help="可选：审阅界面导出的人工评测标注；省略时按单人模式自动登记首个稳定人物轨迹")
-    parser.add_argument("--variant", required=True, choices=VARIANTS, help="bytetrack、body 或 hybrid")
+    parser.add_argument("--variant", required=True, choices=VARIANTS,
+                        help="bytetrack、body、hybrid_no_face（人脸消融）或 hybrid")
     parser.add_argument("--output", type=Path, help="预测 JSON 输出路径")
     parser.add_argument("--device", choices=("cpu", "0"), help="覆盖检测设备；默认使用项目 .env 配置")
     args = parser.parse_args()
@@ -247,9 +248,11 @@ def model_digests(config: AppConfig, variant: str) -> dict[str, str]:
     paths = {"detector": config.det_model}
     if variant == "body":
         paths["body_reid"] = config.person_weights
-    elif variant == "hybrid":
-        paths.update(body_reid=config.person_weights, face_detector=config.face_detector_weights,
-                     face_recognizer=config.face_recognizer_weights)
+    elif variant in {"hybrid", "hybrid_no_face"}:
+        paths["body_reid"] = config.person_weights
+        if variant == "hybrid":
+            paths.update(face_detector=config.face_detector_weights,
+                         face_recognizer=config.face_recognizer_weights)
     elif config.reid_model == "mobilenet_v3_small":
         paths["legacy_reid"] = config.reid_weights
     return {name: sha256_file(path) for name, path in paths.items() if path.is_file()}
@@ -284,7 +287,8 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
         # 这个对照只保留初始轨迹编号；轨迹结束/换号后不做外观重识别。
         session = Tracker(config)
     else:
-        session = pipeline.create_tracker(clock=clock)
+        session = pipeline.create_tracker(clock=clock,
+                                          use_face_evidence=args.variant != "hybrid_no_face")
 
     capture = cv2.VideoCapture(str(args.video))
     if not capture.isOpened():
@@ -469,6 +473,7 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
                        "det_device": config.det_device, "identity_device": config.identity_device,
                        "track_max_age": config.track_max_age,
                        "face_match_threshold": config.face_match_threshold,
+                       "face_evidence_enabled": args.variant != "hybrid_no_face",
                        "body_match_threshold": config.body_match_threshold,
                        "body_hold_threshold": config.body_hold_threshold,
                        "reid_confirm_frames": config.reid_confirm_frames},

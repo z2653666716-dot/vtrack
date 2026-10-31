@@ -9,10 +9,11 @@
 | ByteTrack 基线 | ByteTrack 依靠检测框与运动连续性；初始目标关联到的轨迹号视为目标，不增加跨轨迹身份恢复 | 轨迹中断或换号时，纯运动关联能保留目标多久 |
 | 身体外观方案 | BoT-SORT + OSNet 身体特征，不使用 SFace 人脸证据 | 增加身体外观后，对远近变化和重入有何影响 |
 | ViTrack 联合方案 | BoT-SORT + OSNet + YuNet/SFace，并使用当前多帧确认和模板策略 | 当前完整身份流程的实际结果 |
+| 人脸证据消融 | 与 ViTrack 联合方案使用同一 `HybridSession`、检测器、BoT-SORT、OSNet 和确认门槛，只关闭人脸证据 | 当前视频中的变化是否来自人脸证据开关 |
 
 正式比较入口已实现为 `scripts/evaluate_video.py`：`bytetrack` 使用 ByteTrack 轨迹号，`body` 使用 BoT-SORT + OSNet 外观身份流程，`hybrid` 使用当前完整人脸/身体联合会话。三者均复用项目 `Pipeline`，同一人工标注登记帧各自新建会话。是否能在当前电脑完成推理仍取决于模型文件和运行环境，模型加载失败会明确报错，不生成伪造预测。
 
-上述方案之间存在多个模块变化，因此它们适合回答“整套方案是否更适合这个任务”，不能据此单独宣称“SFace 带来了全部提升”。要归因到人脸模块，后续还需增加一组只开关人脸证据、其余设置相同的消融比较。公开论文中的 MOT 或人脸识别成绩来自不同数据、标注和任务定义，只用于解释方法背景，不直接与本项目数字相减。
+ByteTrack、body 和完整 hybrid 是整套方案对比，不能单独把它们的差异归因给某个模型。`hybrid_no_face` 才是人脸证据消融：沿用同一身份会话与 OSNet，只关闭人脸编码、匹配和人脸补充检测框。公开论文中的 MOT 或人脸识别成绩来自不同数据、标注和任务定义，只用于解释方法背景，不直接与本项目数字相减。
 
 ## 固定实验条件
 
@@ -87,8 +88,20 @@ $video = "resources\你的测试视频.mp4"
 
 & $python -X utf8 scripts/evaluate_video.py --video $video --variant bytetrack
 & $python -X utf8 scripts/evaluate_video.py --video $video --variant body
+& $python -X utf8 scripts/evaluate_video.py --video $video --variant hybrid_no_face
 & $python -X utf8 scripts/evaluate_video.py --video $video --variant hybrid
 ```
+
+同一个视频要归因人脸证据时，完整 `hybrid` 和 `hybrid_no_face` 使用同一登记方式与其他配置。传入人工确认的离场起始帧和重现帧，运行汇总器：
+
+```powershell
+& $python -X utf8 scripts/summarize_ablation.py `
+  --hybrid outputs\evaluation\你的测试视频_hybrid_predictions.json `
+  --no-face outputs\evaluation\你的测试视频_hybrid_no_face_predictions.json `
+  --absent-range 266:389
+```
+
+`--absent-range 266:389` 表示第266帧起离场，第389帧重新出现；起始包含、重现帧不包含。多个离场区间可重复传入参数。汇总器检查视频 SHA、模型哈希、共享配置、帧时间和登记时刻，生成逐帧 CSV 及 JSON/Markdown 报告。它报告可见帧绑定覆盖率和离场期间仍然显示绑定的帧数，不会把没有人工逐帧真值的结果称作身份准确率。
 
 审阅时可依次将每个预测 JSON 载入界面核对暂停帧和备注。上述自动初始化预测没有人工真值，不能直接交给汇总器计算准确率。要生成定量报告，先导出带人物框的人工 JSON，再为三个方案分别增加 `--annotations $annotations` 重跑；之后才运行汇总器。汇总器要求三份预测使用相同视频、相同人工标注摘要、相同检测权重/尺寸/阈值/设备和身份推理设备；不同跟踪与身份算法本身是比较变量。默认 IoU 0.5 为主结果，同时固定输出 0.3 与 0.7 的门槛敏感性检查。
 

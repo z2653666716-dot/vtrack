@@ -92,15 +92,63 @@ class Gallery:
         return scores[0][1], scores[0][0], scores[1][0] if len(scores) > 1 else -1.0
 
     def append(self, identity_id, feature):
-        """输入确认匹配的特征，保留原始注册模板，再用有限滚动模板补充新姿态。"""
+        """输入确认匹配的特征，保留原始注册模板，再用有限滚动模板补充新姿态。
+
+        返回是否实际增加模板，供离线诊断区分“满足更新条件”和“模板确实改变”。
+        """
         identity = self.items[identity_id]
         if self.config.reid_max_templates <= 1:
-            return
+            return False
         if max(cosine(feature, template) for template in identity.templates) > 0.995:
-            return
+            return False
         identity.templates.append(normalize(feature).copy())
         if len(identity.templates) > self.config.reid_max_templates:
             del identity.templates[1]
+        return True
+
+    def update_ema(self, identity_id, feature, alpha, appearance_dimensions=None):
+        """用 EMA 更新单个动态槽，保留第一个锚点并可只平滑 OSNet 身体分量。
+
+        输入已确认的特征、当前观测权重 alpha 和可选的身体特征维数；输出是否更新、
+        跳过原因及模板数。B1/B2 每个身份只用 templates[0] 锚点与 templates[1] 动态槽，
+        两组的匹配仍由 score() 对这些模板取最高余弦相似度。
+        """
+        identity = self.items[identity_id]
+        if (isinstance(alpha, bool) or not isinstance(alpha, (int, float))
+                or not np.isfinite(alpha) or not 0 <= alpha <= 1):
+            raise ValueError("EMA alpha 必须是 0 到 1 之间的有限数")
+        if self.config.reid_max_templates <= 1:
+            return {"updated": False, "reason": "template_capacity_one",
+                    "template_count": len(identity.templates)}
+        incoming = normalize(feature)
+        anchor = identity.templates[0]
+        if incoming.shape != anchor.shape:
+            raise ValueError("EMA 输入特征维度必须与初始模板一致")
+        if appearance_dimensions is None:
+            appearance_dimensions = len(incoming)
+        if (type(appearance_dimensions) is not int or not 1 <= appearance_dimensions <= len(incoming)):
+            raise ValueError("appearance_dimensions 必须在特征向量范围内")
+        if alpha == 0:
+            return {"updated": False, "reason": "zero_quality_weight",
+                    "template_count": len(identity.templates)}
+
+        # 第一份动态模板从原始锚点开始，确保 B1/B2 使用完全相同的更新结构。
+        old = identity.templates[1] if len(identity.templates) > 1 else anchor
+        old_body = normalize(old[:appearance_dimensions])
+        new_body = normalize(incoming[:appearance_dimensions])
+        body_scale = float(np.linalg.norm(old[:appearance_dimensions]))
+        mixed_body = normalize((1.0 - float(alpha)) * old_body + float(alpha) * new_body) * body_scale
+        if appearance_dimensions < len(incoming):
+            # 只更新 OSNet 部分；拼接向量后面的颜色分量保持锚点值，避免把颜色变化混称 OSNet 质量。
+            updated = np.concatenate([mixed_body, old[appearance_dimensions:]])
+        else:
+            updated = mixed_body
+        updated = normalize(updated)
+        if len(identity.templates) > 1:
+            identity.templates[1] = updated
+        else:
+            identity.templates.append(updated)
+        return {"updated": True, "reason": "ema_applied", "template_count": len(identity.templates)}
 
     def summaries(self, online):
         """输入本帧在线身份集合，输出页面摘要，不泄露内部向量。"""

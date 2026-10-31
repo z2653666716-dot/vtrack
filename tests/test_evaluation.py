@@ -19,6 +19,9 @@ def test_target_box_resolves_unknown_visibility_but_empty_unknown_stays_unknown(
     ) == (True, True)
     assert effective_target_visibility("unknown", [], "person-1") == (None, False)
     assert effective_target_visibility("absent", [], "person-1") == (False, False)
+    assert effective_target_visibility(
+        "occluded", [{"person_id": "person-1", "bbox_xyxy": [0, 0, 1, 1]}], "person-1"
+    ) == (None, False)
 
 
 def observation(
@@ -90,6 +93,39 @@ def test_summary_returns_none_for_empty_denominators() -> None:
     assert visible_unbound["visible_correct_binding_ratio"] == 0
     assert visible_unbound["bound_correct_ratio"] is None
     assert visible_unbound["mean_processing_ms"] is None
+
+
+def test_summary_separates_full_occlusion_from_visible_and_unknown_frames() -> None:
+    """完全遮挡帧排除可见覆盖分母，但单独统计系统仍显示绑定的次数。"""
+    frames = [
+        FrameObservation(0, 0, True, "target", 10, False, 0.75, 1),
+        FrameObservation(1, 1, None, None, 12, True, 0.0, 1),
+        FrameObservation(2, 2, None, None, 14, False, None, 0),
+        FrameObservation(3, 3, True, None, 16, False, 0.20, 0),
+    ]
+
+    result = summarize_frames(frames)
+
+    assert result["total_frames"] == 4
+    assert result["visible_frames"] == 2
+    assert result["occluded_frames"] == 1
+    assert result["unknown_frames"] == 1
+    assert result["occluded_frames_with_binding"] == 1
+    assert result["occluded_bound_boxes"] == 1
+    assert result["visible_correct_binding_ratio"] == pytest.approx(0.5)
+    assert result["visible_binding_by_visibility_ratio"]["(0.5,0.75]"]["frames"] == 1
+    assert result["visible_binding_by_visibility_ratio"]["(0,0.25]"]["frames"] == 1
+
+
+def test_visibility_ratio_and_occlusion_flags_must_not_contradict() -> None:
+    """visibility=0 不可同时算作可见；完全遮挡状态必须与比例一致。"""
+    contradictory = FrameObservation(0, 0, True, None, None, True, 0.0, 0)
+    with pytest.raises(ValueError, match="完全遮挡帧不能同时标为可见"):
+        validate_frames([contradictory])
+
+    wrong_ratio = FrameObservation(0, 0, None, None, None, True, 0.2, 0)
+    with pytest.raises(ValueError, match="可见比例必须为 0"):
+        validate_frames([wrong_ratio])
 
 
 @pytest.mark.parametrize(

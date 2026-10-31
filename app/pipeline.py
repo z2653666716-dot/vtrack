@@ -75,10 +75,13 @@ class Pipeline:
         self.recommended_max_side = self.config.max_side
         self.slow_frames = 0
 
-    def create_tracker(self, clock=None, use_face_evidence=True) -> VideoSession:
-        """创建独立视频会话；离线消融可只关闭人脸证据，不改变其他会话逻辑。"""
+    def create_tracker(self, clock=None, use_face_evidence=True,
+                       body_template_update="append", collect_template_diagnostics=False) -> VideoSession:
+        """创建独立视频会话；默认维持生产模板策略，离线实验可显式注入 B0/B1/B2。"""
         session = (HybridSession(self.config, clock=clock,
-                                 use_face_evidence=use_face_evidence)
+                                 use_face_evidence=use_face_evidence,
+                                 body_template_update=body_template_update,
+                                 collect_template_diagnostics=collect_template_diagnostics)
                    if self.config.identity_mode == "hybrid"
                    else VideoSession(self.config, clock=clock))
         self.sessions[session.token] = session

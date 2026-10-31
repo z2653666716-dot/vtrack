@@ -14,6 +14,8 @@ import json
 import math
 from pathlib import Path
 import sys
+from collections import Counter
+from statistics import median
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,12 +76,14 @@ def intersection_over_union(first: list[float], second: list[float]) -> float:
 def classify_binding(annotation: dict, prediction: dict, target_id: str,
                      threshold: float) -> tuple[str | None, dict]:
     """把一帧系统绑定框映射为 target/other/unmatched；不信任系统自报身份名。"""
-    if annotation["target_visibility"] == "unknown":
-        return None, {"bound_boxes": 0, "duplicate_bound": False, "matched_person_id": None,
-                      "binding_iou": None, "reason": "human_unknown"}
     bound_boxes = [box for box in prediction.get("boxes", []) if box.get("bound_to_target") is True]
     detail = {"bound_boxes": len(bound_boxes), "duplicate_bound": len(bound_boxes) > 1,
               "matched_person_id": None, "binding_iou": None, "reason": None}
+    if annotation["target_visibility"] in {"unknown", "occluded"}:
+        detail["reason"] = ("target_fully_occluded" if annotation["target_visibility"] == "occluded"
+                             else "human_unknown")
+        # 完全遮挡时没有可见真值框，不能用插值框给系统框硬判成目标或错绑。
+        return None, detail
     if not bound_boxes:
         detail["reason"] = "not_bound"
         return None, detail
@@ -192,6 +196,7 @@ def evaluate_variant(annotation: dict, item: dict, iou_threshold: float) -> dict
     visible_wrong = 0
     visible_unmatched = 0
     inferred_visibility = 0
+    occluded_bound_rows = []
 
     for human_frame in sorted(annotation.get("annotations", []), key=lambda row: row["frame_index"]):
         frame_index = human_frame["frame_index"]
@@ -211,6 +216,9 @@ def evaluate_variant(annotation: dict, item: dict, iou_threshold: float) -> dict
             target_visible=visibility,
             binding=binding,
             processing_ms=processing_ms,
+            target_occluded=human_frame["target_visibility"] == "occluded",
+            target_visibility_ratio=human_frame.get("target_visibility_ratio"),
+            bound_box_count=detail["bound_boxes"],
         ))
         detection_iou = target_detection_iou(effective_frame, prediction, target_id)
         if visibility is True:
@@ -228,6 +236,7 @@ def evaluate_variant(annotation: dict, item: dict, iou_threshold: float) -> dict
             "frame_index": frame_index,
             "video_time_seconds": human_frame["video_time_seconds"],
             "target_visibility": "visible" if inferred else human_frame["target_visibility"],
+            "target_visibility_ratio": human_frame.get("target_visibility_ratio"),
             "visibility_inferred_from_target_box": inferred,
             "binding": binding or "unbound_or_unknown",
             "matched_person_id": detail["matched_person_id"],
@@ -242,6 +251,8 @@ def evaluate_variant(annotation: dict, item: dict, iou_threshold: float) -> dict
             failure_rows.append(row)
         elif visibility is False and binding is not None:
             failure_rows.append(row)
+        if human_frame["target_visibility"] == "occluded" and detail["bound_boxes"]:
+            occluded_bound_rows.append({**row, "binding": "unscored_during_full_occlusion"})
 
     summary = summarize_frames(observations)
     summary.update({
@@ -290,7 +301,8 @@ def evaluate_variant(annotation: dict, item: dict, iou_threshold: float) -> dict
     })
 
     return {"summary": summary, "reentry_events": reentry_results,
-            "frame_rows": frame_rows, "failure_rows": failure_rows}
+            "frame_rows": frame_rows, "failure_rows": failure_rows,
+            "occluded_bound_rows": occluded_bound_rows}
 
 
 def percentage_points(value: float | None, baseline: float | None) -> float | None:
@@ -298,6 +310,39 @@ def percentage_points(value: float | None, baseline: float | None) -> float | No
     if value is None or baseline is None:
         return None
     return round((value - baseline) * 100, 3)
+
+
+def summarize_template_updates(records: list[dict]) -> dict:
+    """汇总一方案的数值更新诊断，报告资格、实际写入、原因和 alpha 分布。"""
+    eligible = [row for row in records if row.get("eligible") is True]
+    updated = [row for row in records if row.get("updated") is True]
+    alphas = [row["alpha"] for row in updated
+              if isinstance(row.get("alpha"), (int, float)) and not isinstance(row["alpha"], bool)]
+    qualities = [row["quality"] for row in eligible
+                 if isinstance(row.get("quality"), (int, float)) and not isinstance(row.get("quality"), bool)]
+    sources = {}
+    for source in sorted({row.get("source", "unknown") for row in records}):
+        group = [row for row in records if row.get("source", "unknown") == source]
+        sources[source] = {
+            "opportunities": len(group),
+            "eligible": sum(row.get("eligible") is True for row in group),
+            "updated": sum(row.get("updated") is True for row in group),
+        }
+    return {
+        "diagnostic_records": len(records),
+        "eligible_opportunities": len(eligible),
+        "actual_template_updates": len(updated),
+        "ineligible_reasons": dict(Counter(row.get("reason", "unspecified")
+                                            for row in records if row.get("eligible") is False)),
+        "update_results": dict(Counter(row.get("reason", "unspecified") for row in eligible)),
+        "sources": sources,
+        "quality_min": min(qualities) if qualities else None,
+        "quality_median": median(qualities) if qualities else None,
+        "quality_max": max(qualities) if qualities else None,
+        "alpha_min": min(alphas) if alphas else None,
+        "alpha_median": median(alphas) if alphas else None,
+        "alpha_max": max(alphas) if alphas else None,
+    }
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -321,8 +366,8 @@ def markdown_report(report: dict) -> str:
         f"可见状态修正：{report.get('visibility_inferred_from_target_boxes', 0)} 帧根据人工标注的目标人物框从 unknown 计为 visible。",
         f"框匹配主门槛：IoU ≥ {report['iou_threshold']:.2f}；无法匹配或存在多人歧义的框不计作身份错误。",
         "",
-        "| 方案 | 目标正确覆盖率 | 匹配绑定框身份正确率 | 匹配绑定框错绑率 | 目标检测召回率 | 可见目标帧 | 错绑帧 | 未绑定帧 | 无法对应绑定框 | 重入成功/可评 | 恢复/确认延迟(s) | 平均处理耗时(ms) | 耗时样本 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 方案 | 目标正确覆盖率 | 匹配绑定框身份正确率 | 匹配绑定框错绑率 | 目标检测召回率 | 可见目标帧 | 完全遮挡帧 | 遮挡时仍绑定帧 | 错绑帧 | 未绑定帧 | 无法对应绑定框 | 重入成功/可评 | 恢复/确认延迟(s) | 平均处理耗时(ms) | 耗时样本 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for variant, result in report["variants"].items():
         metrics = result["summary"]
@@ -336,12 +381,33 @@ def markdown_report(report: dict) -> str:
             f"| {variant} | {percent(metrics['visible_correct_binding_ratio'])} "
             f"| {percent(metrics['bound_correct_ratio'])} | {percent(metrics['wrong_person_bound_ratio'])} "
             f"| {percent(metrics['target_detection_recall'])} | {metrics['visible_frames']} "
+            f"| {metrics['occluded_frames']} | {metrics['occluded_frames_with_binding']} "
             f"| {metrics['wrong_person_frames']} | {metrics['visible_unbound_frames']} "
             f"| {metrics['unmatched_binding_frames']} "
             f"| {metrics['successful_reentry_events']}/{metrics['evaluable_reentry_events']} "
             f"| {recovery}/{confirmation} | {number(metrics['mean_processing_ms'])} "
             f"| {metrics['timed_frames']} |"
         )
+    template_variants = {
+        variant: result.get("body_template_updates", {})
+        for variant, result in report["variants"].items()
+        if result.get("body_template_updates", {}).get("diagnostic_records", 0)
+    }
+    if template_variants:
+        lines.extend(["", "## 身体模板更新诊断", "",
+                      "| 方案 | 资格记录 | 合格机会 | 实际模板写入 | 质量中位数 | 实际 alpha 中位数 | alpha 范围 |",
+                      "|---|---:|---:|---:|---:|---:|---:|"])
+        for variant, metrics in template_variants.items():
+            alpha_range = ("无 EMA 写入" if metrics["alpha_min"] is None else
+                           f"{metrics['alpha_min']:.4f}–{metrics['alpha_max']:.4f}")
+            quality_median = ("无样本" if metrics["quality_median"] is None
+                              else f"{metrics['quality_median']:.4f}")
+            alpha_median = ("无 EMA 写入" if metrics["alpha_median"] is None
+                            else f"{metrics['alpha_median']:.4f}")
+            lines.append(f"| {variant} | {metrics['diagnostic_records']} | {metrics['eligible_opportunities']} "
+                         f"| {metrics['actual_template_updates']} | {quality_median} "
+                         f"| {alpha_median} | {alpha_range} |")
+        lines.append("质量分数是启发式图像线索，不是身份概率；诊断次数不等于识别准确率。")
     lines.extend(["", "百分点差值以 `bytetrack` 方案为参照。正值表示该指标比例更高；错绑率下降通常更好。"])
     baseline = report["variants"].get("bytetrack")
     if baseline:
@@ -381,6 +447,7 @@ def markdown_report(report: dict) -> str:
     lines.extend([
         "",
         "重入恢复均值分别报告稳定正确帧串的起点延迟与凑齐确认帧的延迟。",
+        "visibility=0 的完全遮挡帧不进入目标可见覆盖率分母；其绑定状态单独报告，不用推测框判断身份。",
         "",
         "## 结论边界",
         "",
@@ -401,6 +468,7 @@ def main() -> int:
         results = {}
         scenes: dict[str, dict] = {}
         all_frames, all_failures = [], []
+        all_occluded_bindings, all_template_updates = [], []
         for item in prediction_inputs:
             variant = item["payload"]["variant"]
             scored = evaluate_variant(annotation, item, args.iou)
@@ -412,6 +480,10 @@ def main() -> int:
             }
             all_frames.extend(scored["frame_rows"])
             all_failures.extend(scored["failure_rows"])
+            all_occluded_bindings.extend(scored["occluded_bound_rows"])
+            diagnostics = item["payload"].get("body_template_update_diagnostics", [])
+            results[variant]["body_template_updates"] = summarize_template_updates(diagnostics)
+            all_template_updates.extend({"variant": variant, **row} for row in diagnostics)
 
         # 場景分組只取人工逐幀選定的標籤；缺少該欄位的舊標註歸入 unspecified。
         scene_names = sorted({row.get("scene", "unspecified")
@@ -461,6 +533,8 @@ def main() -> int:
         ])
         write_csv(output_dir / "frame_results.csv", all_frames)
         write_csv(output_dir / "failure_cases.csv", all_failures)
+        write_csv(output_dir / "occluded_binding_behavior.csv", all_occluded_bindings)
+        write_csv(output_dir / "template_update_diagnostics.csv", all_template_updates)
         scene_rows = [
             {"scene": scene, "variant": variant, **metrics}
             for scene, variants in scenes.items()

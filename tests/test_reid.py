@@ -41,6 +41,34 @@ def test_gallery_margin_templates_and_capacity():
     with pytest.raises(ValueError): gallery.register([0, 0, 1])
 
 
+def test_gallery_ema_preserves_anchor_and_only_updates_body_dimensions():
+    """EMA 动态槽只修改指定身体维度，保留初始锚点和拼接向量颜色尾段。"""
+    gallery = Gallery(AppConfig(reid_max_templates=4))
+    identity = gallery.register([0.6, 0.8, 0.0, 0.0])
+    anchor = identity.templates[0].copy()
+
+    result = gallery.update_ema(identity.id, [0.0, 0.6, 0.8, 0.0], 0.25,
+                                appearance_dimensions=2)
+
+    assert result["updated"] is True
+    assert len(identity.templates) == 2
+    assert np.array_equal(identity.templates[0], anchor)
+    assert np.array_equal(identity.templates[1][2:], anchor[2:])
+    assert cosine(identity.templates[1][:2], anchor[:2]) < 1
+
+
+def test_gallery_ema_zero_weight_and_invalid_alpha_are_safe():
+    """质量为零不建新槽；非法 alpha 在修改模板前报错。"""
+    gallery = Gallery(AppConfig(reid_max_templates=4))
+    identity = gallery.register([1.0, 0.0])
+    skipped = gallery.update_ema(identity.id, [0.0, 1.0], 0.0)
+    assert skipped["reason"] == "zero_quality_weight"
+    assert len(identity.templates) == 1
+    with pytest.raises(ValueError, match="alpha"):
+        gallery.update_ema(identity.id, [0.0, 1.0], float("nan"))
+    assert len(identity.templates) == 1
+
+
 def test_expired_track_relocks_without_claiming_different_color():
     """丢失超过轨迹期限后身份还在：新轨迹需连续确认；另一颜色不得变绿。"""
     cfg = AppConfig(det_device="cpu", reid_model="color_histogram", reid_ema=0, track_max_age=3)

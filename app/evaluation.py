@@ -31,6 +31,9 @@ class FrameObservation:
     target_visible: bool | None
     binding: Binding
     processing_ms: float | None = None
+    target_occluded: bool = False
+    target_visibility_ratio: float | None = None
+    bound_box_count: int = 0
 
 
 def effective_target_visibility(
@@ -48,9 +51,12 @@ def effective_target_visibility(
         for person in people
     ):
         return True, True
-    values = {"visible": True, "absent": False, "unknown": None}
+    values = {"visible": True, "absent": False, "unknown": None, "occluded": None}
     if visibility not in values:
-        raise ValueError("目标可见状态只能是 visible、absent 或 unknown")
+        raise ValueError("目标可见状态只能是 visible、absent、occluded 或 unknown")
+    # 完全遮挡时即使标注仍提供推测框，也不能据此推断目标可见。
+    if visibility == "occluded":
+        return None, False
     return values[visibility], False
 
 
@@ -69,6 +75,20 @@ def validate_frames(frames: Sequence[FrameObservation]) -> None:
             raise ValueError("视频时间必须严格递增，不能重复或倒序")
         if frame.target_visible is not None and type(frame.target_visible) is not bool:
             raise ValueError("目标可见性只能是 True、False 或 None")
+        if type(frame.target_occluded) is not bool:
+            raise ValueError("target_occluded 必须是布尔值")
+        if frame.target_occluded and frame.target_visible is not None:
+            raise ValueError("完全遮挡帧不能同时标为可见或离场")
+        if frame.target_visibility_ratio is not None:
+            _check_number(frame.target_visibility_ratio, "目标可见比例")
+            if frame.target_visibility_ratio > 1:
+                raise ValueError("目标可见比例必须在 0 到 1 之间")
+            if frame.target_occluded and frame.target_visibility_ratio != 0:
+                raise ValueError("完全遮挡帧的可见比例必须为 0")
+            if frame.target_visible is True and frame.target_visibility_ratio == 0:
+                raise ValueError("目标可见帧的可见比例必须大于 0")
+        if type(frame.bound_box_count) is not int or frame.bound_box_count < 0:
+            raise ValueError("已绑定框数量必须是非负整数")
         if frame.binding not in (None, "target", "other", "unmatched"):
             raise ValueError("绑定判断只能是 target、other、unmatched 或 None")
         if frame.target_visible is False and frame.binding == "target":
@@ -99,6 +119,7 @@ def summarize_frames(frames: Sequence[FrameObservation]) -> dict:
     无法与人工人物框对应的绑定框单独计数，不把定位失败直接当成身份认错。
     """
     validate_frames(frames)
+    occluded = [frame for frame in frames if frame.target_occluded]
     scored = [frame for frame in frames if frame.target_visible is not None]
     visible = [frame for frame in scored if frame.target_visible]
     correct = sum(frame.binding == "target" for frame in scored)
@@ -108,11 +129,32 @@ def summarize_frames(frames: Sequence[FrameObservation]) -> dict:
     # 只有能和人工人物框建立唯一对应的绑定框，才回答“身份认对没有”。
     # 无法匹配的框另行报告，避免把框偏移误算为错认人。
     matched_bound = correct + wrong
-    timings = [frame.processing_ms for frame in scored if frame.processing_ms is not None]
+    timings = [frame.processing_ms for frame in frames
+               if not frame.target_occluded and frame.target_visible is not None
+               and frame.processing_ms is not None]
+    visibility_groups = (
+        ("(0,0.25]", 0.0, 0.25), ("(0.25,0.5]", 0.25, 0.5),
+        ("(0.5,0.75]", 0.5, 0.75), ("(0.75,1]", 0.75, 1.0),
+    )
+    visibility_strata = {}
+    for label, lower, upper in visibility_groups:
+        samples = [frame for frame in visible
+                   if frame.target_visibility_ratio is not None
+                   and lower < frame.target_visibility_ratio <= upper]
+        correct_in_bin = sum(frame.binding == "target" for frame in samples)
+        visibility_strata[label] = {
+            "frames": len(samples),
+            "correct_binding_frames": correct_in_bin,
+            "correct_binding_ratio": _ratio(correct_in_bin, len(samples)),
+        }
     # 延迟独立统计样本数；没有耗时的帧仍参与身份评测，不能填 0 拉低平均值。
     return {
         "total_frames": len(frames),
         "ignored_frames": len(frames) - len(scored),
+        "unknown_frames": len(frames) - len(scored) - len(occluded),
+        "occluded_frames": len(occluded),
+        "occluded_frames_with_binding": sum(frame.bound_box_count > 0 for frame in occluded),
+        "occluded_bound_boxes": sum(frame.bound_box_count for frame in occluded),
         "scored_frames": len(scored),
         "visible_frames": len(visible),
         "absent_frames": len(scored) - len(visible),
@@ -132,6 +174,7 @@ def summarize_frames(frames: Sequence[FrameObservation]) -> dict:
         "unmatched_bound_ratio": _ratio(unmatched, bound),
         "timed_frames": len(timings),
         "mean_processing_ms": sum(timings) / len(timings) if timings else None,
+        "visible_binding_by_visibility_ratio": visibility_strata,
     }
 
 

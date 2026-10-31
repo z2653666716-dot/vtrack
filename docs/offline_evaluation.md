@@ -108,3 +108,32 @@ $video = "resources\你的测试视频.mp4"
 ## 结果解释边界
 
 单个短视频只能说明这些方案在该视频和标注规则下的表现，不能支撑普遍准确率或统计显著性结论。最终简历应写成“在自录场景的固定评测中，某指标从 A 变化到 B，条件为……”，同时保留测试规模与失败类型；拿到可重复的多视频测试集后再总结泛化结论。
+
+## 多序列身体模板更新实验（B0/B1/B2）
+
+`hybrid_b0` 使用现有追加模板逻辑；`hybrid_b1` 保留初始锚点并用固定权重 EMA 更新身体动态模板；`hybrid_b2` 保持 B1 的资格条件与时机，只令 EMA 权重乘以观测质量分数。质量分数由人物裁剪尺寸、清晰度、画面边缘风险和与旁人框重叠构成，只用于降低低质量观测的更新权重，不是身份置信度。
+
+准备 MOT17 训练序列时，视频从 MOTChallenge 官方序列下载项取得，标签使用 `MOT17Labels.zip`。原始视频、标签和生成的完整帧级标注只保存在本地 `work/` 与被忽略的 `outputs/`，不可提交到 Git、源码包或公开报告仓库。MOT17 官方条款为 CC BY-NC-SA 3.0；引用时应注明 MOTChallenge 及其论文，任何对数据本身的再分发都需遵守原条款。MOT17-05/09 已用于开发；本项目记录里未发现 02/04/10/11/13 被用于调参，因此本次把这些完整序列作为项目内冻结保留集。它们仍属于 MOT17 training split，**不是官方 test split，也不证明跨数据集泛化**。
+
+先固定代码和参数，再对同一视频分别运行三种方案。登记帧由标注工具自动取目标首次满足条件的可见帧；所有方案使用同一检测器、视频帧、目标 ID、模型与配置。不要在查看保留结果后调整阈值或质量映射；如需修改，应另留新的未见视频。
+
+```powershell
+$python = ".\envs\vitrack\python.exe"
+$sequence = "02"
+$video = "work\public_datasets\mot17_holdout\MOT17-$sequence-DPM-raw.mp4"
+$labels = "work\public_datasets\mot17_holdout\MOT17Labels.zip"
+$annotations = "outputs\evaluation\MOT17-$sequence\MOT17-$sequence-DPM_visibility_annotations.json"
+& $python -X utf8 scripts/prepare_mot17_annotations.py --labels-zip $labels --video $video --sequence $sequence --output $annotations
+foreach ($variant in @("hybrid_b0", "hybrid_b1", "hybrid_b2")) {
+  & $python -X utf8 scripts/evaluate_video.py --video $video --annotations $annotations --variant $variant --output "outputs\evaluation\quality_template\MOT17-$sequence`_$variant`_predictions.json"
+}
+& $python -X utf8 scripts/summarize_evaluation.py --annotations $annotations --predictions `
+  "outputs\evaluation\quality_template\MOT17-$sequence`_hybrid_b0_predictions.json" `
+  "outputs\evaluation\quality_template\MOT17-$sequence`_hybrid_b1_predictions.json" `
+  "outputs\evaluation\quality_template\MOT17-$sequence`_hybrid_b2_predictions.json" `
+  --output-dir "outputs\evaluation\quality_template\MOT17-$sequence\report"
+```
+
+逐视频报告包含 JSON、CSV 和 Markdown。把至少两条完整视频的 `evaluation_summary.json` 传给 `scripts/summarize_sequence_group.py --reports ... --output-dir ...`，可再生成多视频 JSON、CSV、Markdown。汇总同时给出帧加权与视频等权覆盖率：前者回答所有已评帧中有多少正确绑定，后者避免较长序列独占总结果。相邻帧高度相关，推断样本量时仍以完整视频数为准，不报告统计显著性。
+
+保留集应原样报告所有运行结果，包括登记失败、未绑定和错绑。若要继续开发，先把保留集降级为开发数据，不能继续把同一组视频称作未见测试。处理耗时是电脑离线端单帧后端耗时，不代表手机 FPS 或端到端延迟。MOT17 标签文件提供训练集真值；公开榜单上的 MOT17 test split 没有公开 GT，不能用其可视化视频估算身份准确率。

@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts import summarize_evaluation
 
 
@@ -72,3 +74,31 @@ def test_summary_cli_writes_scene_and_iou_reports(tmp_path, monkeypatch):
     assert (output_dir / "scene_summary.csv").is_file()
     assert (output_dir / "iou_sensitivity.csv").is_file()
     assert (output_dir / "failure_cases.csv").is_file()
+
+
+def test_fully_occluded_target_is_not_matched_to_interpolated_ground_truth():
+    """遮挡帧仍报告绑定框数量，但不拿不可见目标框判断系统框身份。"""
+    prediction = {"boxes": [{"bbox_xyxy": [0.1, 0.1, 0.5, 0.9], "bound_to_target": True}]}
+    binding, detail = summarize_evaluation.classify_binding(
+        {"target_visibility": "occluded", "people": []}, prediction, "target", 0.5)
+    assert binding is None
+    assert detail["bound_boxes"] == 1
+    assert detail["reason"] == "target_fully_occluded"
+
+
+def test_template_update_summary_reports_opportunities_and_alpha_statistics():
+    """更新诊断要区分不合格原因、合格机会和实际 EMA 写入。"""
+    result = summarize_evaluation.summarize_template_updates([
+        {"source": "body_transition", "eligible": False, "reason": "body_score_low",
+         "quality": 0.2, "updated": False, "alpha": None},
+        {"source": "face_confirmed", "eligible": True, "reason": "ema_applied",
+         "quality": 0.8, "updated": True, "alpha": 0.08},
+        {"source": "face_confirmed", "eligible": True, "reason": "ema_applied",
+         "quality": 0.4, "updated": True, "alpha": 0.04},
+    ])
+    assert result["diagnostic_records"] == 3
+    assert result["eligible_opportunities"] == 2
+    assert result["actual_template_updates"] == 2
+    assert result["quality_median"] == pytest.approx(0.6)
+    assert result["alpha_median"] == pytest.approx(0.06)
+    assert result["ineligible_reasons"] == {"body_score_low": 1}

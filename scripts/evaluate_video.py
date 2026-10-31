@@ -35,7 +35,8 @@ from app.tracker import Tracker
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
-VARIANTS = ("bytetrack", "body", "hybrid_no_face", "hybrid")
+VARIANTS = ("bytetrack", "body", "hybrid_no_face", "hybrid",
+            "hybrid_b0", "hybrid_b1", "hybrid_b2")
 REGISTRATION_IOU = 0.5
 
 
@@ -65,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video", required=True, type=Path, help="本地视频文件路径，不支持摄像头或网络流")
     parser.add_argument("--annotations", type=Path, help="可选：审阅界面导出的人工评测标注；省略时按单人模式自动登记首个稳定人物轨迹")
     parser.add_argument("--variant", required=True, choices=VARIANTS,
-                        help="bytetrack、body、hybrid_no_face（人脸消融）或 hybrid")
+                        help="现有对照方案，或 hybrid_b0/b1/b2 身体模板更新对照")
     parser.add_argument("--output", type=Path, help="预测 JSON 输出路径")
     parser.add_argument("--device", choices=("cpu", "0"), help="覆盖检测设备；默认使用项目 .env 配置")
     args = parser.parse_args()
@@ -110,8 +111,15 @@ def load_annotations(path: Path, video_path: Path) -> tuple[dict, dict[int, dict
         if (isinstance(time_seconds, bool) or not isinstance(time_seconds, (int, float))
                 or not math.isfinite(time_seconds) or time_seconds < 0):
             raise ValueError("人工标注视频时间必须是有限非负数")
-        if row.get("target_visibility") not in {"visible", "absent", "unknown"}:
-            raise ValueError("target_visibility 只能是 visible、absent 或 unknown")
+        if row.get("target_visibility") not in {"visible", "absent", "occluded", "unknown"}:
+            raise ValueError("target_visibility 只能是 visible、absent、occluded 或 unknown")
+        visibility_ratio = row.get("target_visibility_ratio")
+        if visibility_ratio is not None and (
+                isinstance(visibility_ratio, bool) or not isinstance(visibility_ratio, (int, float))
+                or not math.isfinite(visibility_ratio) or not 0 <= visibility_ratio <= 1):
+            raise ValueError(f"第 {frame_index} 帧 target_visibility_ratio 必须在 0 到 1 之间")
+        if row["target_visibility"] == "occluded" and visibility_ratio != 0:
+            raise ValueError(f"第 {frame_index} 帧完全遮挡标注必须有 visibility ratio 0")
         people = row.get("people", [])
         if not isinstance(people, list):
             raise ValueError("people 必须是数组")
@@ -248,7 +256,7 @@ def model_digests(config: AppConfig, variant: str) -> dict[str, str]:
     paths = {"detector": config.det_model}
     if variant == "body":
         paths["body_reid"] = config.person_weights
-    elif variant in {"hybrid", "hybrid_no_face"}:
+    elif variant in {"hybrid", "hybrid_no_face", "hybrid_b0", "hybrid_b1", "hybrid_b2"}:
         paths["body_reid"] = config.person_weights
         if variant == "hybrid":
             paths.update(face_detector=config.face_detector_weights,
@@ -287,8 +295,13 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
         # 这个对照只保留初始轨迹编号；轨迹结束/换号后不做外观重识别。
         session = Tracker(config)
     else:
+        template_strategy = {"hybrid_b0": "append", "hybrid_b1": "fixed_ema",
+                             "hybrid_b2": "quality_ema"}.get(args.variant, "append")
+        collect_template_diagnostics = args.variant in {"hybrid_b0", "hybrid_b1", "hybrid_b2"}
         session = pipeline.create_tracker(clock=clock,
-                                          use_face_evidence=args.variant != "hybrid_no_face")
+                                          use_face_evidence=args.variant != "hybrid_no_face",
+                                          body_template_update=template_strategy,
+                                          collect_template_diagnostics=collect_template_diagnostics)
 
     capture = cv2.VideoCapture(str(args.video))
     if not capture.isOpened():
@@ -309,6 +322,7 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
     pending_lock_track_id = None
     pending_registration_box = None
     predictions = []
+    template_update_diagnostics = []
     previous_timestamp = -1.0
     frame_index = 0
     started_all = perf_counter()
@@ -445,6 +459,8 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
                           for box in output_boxes],
             })
             frame_index += 1
+        if isinstance(session, HybridSession) and collect_template_diagnostics:
+            template_update_diagnostics = list(session.template_update_records)
     finally:
         capture.release()
         if isinstance(session, VideoSession):
@@ -474,6 +490,12 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
                        "track_max_age": config.track_max_age,
                        "face_match_threshold": config.face_match_threshold,
                        "face_evidence_enabled": args.variant != "hybrid_no_face",
+                       "body_template_update": {"hybrid_b0": "append", "hybrid_b1": "fixed_ema",
+                                                "hybrid_b2": "quality_ema"}.get(args.variant),
+                       "body_template_alpha_max": (session.body_template_alpha
+                                                   if isinstance(session, HybridSession)
+                                                   and collect_template_diagnostics else None),
+                       "body_quality_version": ("body-quality-v1" if args.variant == "hybrid_b2" else None),
                        "body_match_threshold": config.body_match_threshold,
                        "body_hold_threshold": config.body_hold_threshold,
                        "reid_confirm_frames": config.reid_confirm_frames},
@@ -485,6 +507,7 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
             "prediction_samples": len(predictions),
         },
         "predictions": predictions,
+        "body_template_update_diagnostics": template_update_diagnostics,
         "privacy": {"video_copied": False, "frames_exported": False, "crops_exported": False,
                     "features_exported": False},
     }

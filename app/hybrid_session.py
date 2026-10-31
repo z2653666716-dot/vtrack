@@ -11,6 +11,7 @@ import cv2
 from .reid import cosine, crop_target, normalize
 from .schemas import Box, Detection
 from .session import Observation, SessionError, VideoSession
+from .template_quality import QUALITY_VERSION, measure_body_quality
 
 
 def overlap(first, second):
@@ -44,20 +45,78 @@ class HybridSession(VideoSession):
     """由Pipeline串行调用；身份重入需要新证据，短时连续跟踪不再要求复现登记姿势。"""
 
     def __init__(self, config, extractor=None, face_encoder=None, clock=None,
-                 use_face_evidence=True):
+                 use_face_evidence=True, body_template_update="append",
+                 collect_template_diagnostics=False):
         super().__init__(config, extractor, clock=clock)
         # 消融评测可关闭人脸证据，同时保留同一身份会话、OSNet、BoT-SORT 与确认规则。
         self.use_face_evidence = bool(use_face_evidence)
+        if body_template_update not in {"append", "fixed_ema", "quality_ema"}:
+            raise ValueError("身体模板更新方案只能是 append、fixed_ema 或 quality_ema")
+        self.body_template_update = body_template_update
+        self.collect_template_diagnostics = bool(collect_template_diagnostics)
+        # B1 与 B2 共用同一 alpha 上限；B2 只乘当前观测质量分数。
+        self.body_template_alpha = 0.1
+        self.template_update_records = []
+        self.template_update_count = 0
         self.face_encoder = face_encoder
         self.face_templates, self.body_valid, self.current_faces = {}, {}, {}
         self.current_body_features = {}
+        self.current_body_quality = {}
         self.unknown_body_overlap = set()
         self.detected_faces = None
         self.face_only_indices, self.face_only_ids = set(), set()
         self.head_only_ids = set()
         self.diagnostic("hybrid_policy", face_match=config.face_match_threshold, face_reject=config.face_reject_threshold,
                         body_match=config.body_match_threshold, body_hold=config.body_hold_threshold,
-                        grace_seconds=config.identity_hold_seconds, face_interval=3, candidate_gap_frames=2)
+                        grace_seconds=config.identity_hold_seconds, face_interval=3, candidate_gap_frames=2,
+                        body_template_update=body_template_update,
+                        body_template_alpha=self.body_template_alpha,
+                        body_quality_version=QUALITY_VERSION)
+
+    def _record_template_update(self, track_id, source, eligible, reason,
+                                quality=None, candidate_alpha=None, alpha=None,
+                                updated=False, template_count=None):
+        """保存不含图像/向量的帧级数值诊断，仅在离线实验显式启用时收集。"""
+        if not self.collect_template_diagnostics or len(self.template_update_records) >= 10000:
+            return
+        quality = quality or {}
+        self.template_update_records.append({
+            "frame_index": int(self.seq), "video_time_seconds": float(self.clock()),
+            "track_id": int(track_id), "source": source,
+            "eligible": bool(eligible), "reason": reason,
+            "quality_size": round(float(quality.get("size", 0.0)), 6),
+            "quality_sharpness": round(float(quality.get("sharpness", 0.0)), 6),
+            "quality_edge": round(float(quality.get("edge", 0.0)), 6),
+            "quality_overlap": round(float(quality.get("overlap", 0.0)), 6),
+            "quality": round(float(quality.get("quality", 0.0)), 6),
+            "candidate_alpha": round(float(candidate_alpha), 6) if candidate_alpha is not None else None,
+            "alpha": round(float(alpha), 6) if alpha is not None else None,
+            "updated": bool(updated), "update_count": self.template_update_count,
+            "template_count": template_count,
+        })
+
+    def _update_body_template(self, key, identity_id, feature, source):
+        """按 B0/B1/B2 写身体特征；人脸模板、确认资格和跟踪状态保持不变。"""
+        quality = self.current_body_quality.get(key, {})
+        if self.body_template_update == "append":
+            changed = self.gallery.append(identity_id, feature)
+            candidate_alpha = alpha = None
+            reason = "template_appended" if changed else "duplicate_or_capacity"
+        else:
+            candidate_alpha = self.body_template_alpha
+            if self.body_template_update == "quality_ema":
+                candidate_alpha *= float(quality.get("quality", 0.0))
+            alpha = candidate_alpha
+            result = self.gallery.update_ema(
+                identity_id, feature, alpha, appearance_dimensions=min(512, len(feature)))
+            changed, reason = result["updated"], result["reason"]
+            if not changed:
+                alpha = 0.0
+        self.template_update_count += int(changed)
+        self._record_template_update(key, source, True, reason, quality,
+                                     candidate_alpha, alpha, changed,
+                                     len(self.gallery.items[identity_id].templates))
+        return changed
 
     def prepare_frame(self, frame, detections):
         """全帧只检测一次人脸；近距离只见脸、YOLO未给人物框时，补充明确标为person-face的观测。"""
@@ -189,21 +248,40 @@ class HybridSession(VideoSession):
         Gallery.append保留原模板且限制总数，所有向量仅在会话内存。
         """
         track = self.observations[key]
-        if self.face_templates.get(identity_id) or feature is None or not self.body_valid.get(identity_id):
+        if self.face_templates.get(identity_id):
+            return False
+        quality = self.current_body_quality.get(key, {})
+        if feature is None:
+            self._record_template_update(key, "body_transition", False, "missing_body_feature", quality)
+            return False
+        if not self.body_valid.get(identity_id):
+            self._record_template_update(key, "body_transition", False, "body_template_unavailable", quality)
             return False
         anchor = self.gallery.items[identity_id].templates[0]
         # 新入镜白框尚无轨迹号/身体特征时，不能把“还没比较”误当成目标已领先。
         unmeasured_person = any(box.cls == 0 and box.track_id != key
                                 and box.track_id not in self.current_body_features for box in self.boxes)
-        reliable = bool(track.body_learning_allowed and track.motion_ok and track.observation_gap == 0
-                        and check["mode"] == "body" and check["body_score"] >= .85
-                        and check.get("body_unique", False) and not unmeasured_person
-                        and cosine(feature[:512], anchor[:512]) >= self.config.body_hold_threshold)
-        if reliable:
+        conditions = [
+            (track.body_learning_allowed, "body_learning_not_allowed"),
+            (track.motion_ok, "motion_not_continuous"),
+            (track.observation_gap == 0, "observation_gap"),
+            (check["mode"] == "body", "identity_mode_not_body"),
+            (check["body_score"] >= .85, "body_score_below_transition_gate"),
+            (check.get("body_unique", False), "body_candidate_not_unique"),
+            (not unmeasured_person, "other_person_not_measured"),
+            (cosine(feature[:512], anchor[:512]) >= self.config.body_hold_threshold,
+             "anchor_similarity_below_hold_gate"),
+        ]
+        failed_reason = next((reason for passed, reason in conditions if not passed), None)
+        if failed_reason is None:
             # 远景到近景逐步变化时先保留强匹配的过渡外观，不能等已经有人脸才更新身体。
             # 不降低重入或补脸门槛；突然变化、旁人同分、只有头部和失踪重入均不能借此学习。
-            self.gallery.append(identity_id, feature)
-        return reliable
+            # 人脸学习资格由身份和运动条件决定；模板重复或 B2 质量权重为零时，
+            # 仍须保持原有的人脸学习流程，不能把“没有写入模板”误作“不具备学习资格”。
+            self._update_body_template(key, identity_id, feature, "body_transition")
+            return True
+        self._record_template_update(key, "body_transition", False, failed_reason, quality)
+        return False
 
     def remember_confirmed(self, key, feature, identity_id, check):
         """输入当前身份依据，补充可靠模板；首份人脸之前仅允许手动原轨迹的受限身体过渡。"""
@@ -216,8 +294,13 @@ class HybridSession(VideoSession):
                 if not self.body_valid.get(identity_id):
                     self.gallery.items[identity_id].templates = [normalize(feature).copy()]
                     self.body_valid[identity_id] = True
-                else:
-                    self.gallery.append(identity_id, feature)
+                    self._record_template_update(key, "initial_body_anchor", False,
+                                                 "initial_template_created",
+                                                 self.current_body_quality.get(key, {}),
+                                                 template_count=1)
+                elif self.face_templates.get(identity_id):
+                    # 已登记人脸的强确认路径保留原有触发时机；B1/B2 仅改变写入权重。
+                    self._update_body_template(key, identity_id, feature, "face_confirmed")
             templates = self.face_templates[identity_id]
             if sample is not None and sample.feature is not None and check["face_score"] >= max(.55, self.config.face_match_threshold):
                 if (cosine(sample.feature, templates[0]) >= self.config.face_match_threshold and
@@ -302,6 +385,15 @@ class HybridSession(VideoSession):
         crops = [(box.track_id, crop_target(frame, box.xyxy)) for box in people]
         crops = [(key, crop) for key, crop in crops if crop is not None]
         features = dict(zip([key for key, _ in crops], self.extractor.extract([crop for _, crop in crops])))
+        # 质量线索使用模型本帧实际拿到的内存裁剪和当前检测框，不写入裁剪或特征。
+        boxes_by_id = {box.track_id: box for box in people}
+        self.current_body_quality = {}
+        if self.body_template_update != "append" or self.collect_template_diagnostics:
+            for key, crop in crops:
+                box = boxes_by_id[key]
+                other_boxes = [other.xyxy for other in all_people if other is not box]
+                self.current_body_quality[key] = measure_body_quality(
+                    crop, box.xyxy, frame.shape[1], frame.shape[0], other_boxes)
         # 只有脸的补充框不能作为全身OSNet身份依据，避免把两种输入混为一谈。
         features = {key: value for key, value in features.items() if key not in self.face_only_ids}
         if self.use_face_evidence:
@@ -450,6 +542,7 @@ class HybridSession(VideoSession):
         self.face_templates.clear()
         self.body_valid.clear()
         self.current_body_features.clear()
+        self.current_body_quality.clear()
         self.unknown_body_overlap.clear()
         for track in self.observations.values():
             if isinstance(track, HybridObservation):
@@ -471,6 +564,9 @@ class HybridSession(VideoSession):
         self.body_valid.clear()
         self.current_faces.clear()
         self.current_body_features.clear()
+        self.current_body_quality.clear()
+        self.template_update_records.clear()
+        self.template_update_count = 0
         self.unknown_body_overlap.clear()
         self.detected_faces = None
         self.face_only_ids.clear()

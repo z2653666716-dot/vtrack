@@ -213,16 +213,21 @@ def model_digests(config: AppConfig, variant: str) -> dict[str, str]:
     return {name: sha256_file(path) for name, path in paths.items() if path.is_file()}
 
 
-def box_record(box: Box, target_track_id: int | None, tracker_only: bool) -> dict:
-    """将单个输出框转为纯数值预测；不序列化任何裁剪或外观特征。"""
-    is_target_track = box.track_id is not None and box.track_id == target_track_id
+def box_record(box: Box, target_track_id: int | None, tracker_only: bool,
+               target_identity_id: str | None = None) -> dict:
+    """将输出框转成纯数值预测；基线看轨迹号，身份方案看稳定身份编号。"""
+    # 轨迹号会在目标离场重入后变化；身份方案必须按登记时的 identity_id 判断。
+    is_target = (box.track_id is not None and box.track_id == target_track_id
+                 if tracker_only else
+                 box.identity_id is not None and box.identity_id == target_identity_id
+                 and box.state == "locked")
     return {
         "bbox_xyxy": [round(float(value), 7) for value in box.xyxy],
         "class_id": box.cls,
         "detection_score": round(float(box.score), 6),
         "track_id": box.track_id,
-        # 纯 ByteTrack 对照只看初始轨迹号；身份方案还要求该帧仍处于 locked 状态。
-        "bound_to_target": is_target_track and (tracker_only or box.state == "locked"),
+        # 不把身份编号写入评测文件，只保存能否对应登记目标这一布尔结果。
+        "bound_to_target": is_target,
         "state": box.state,
     }
 
@@ -250,9 +255,10 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
     registration = annotation_file["registration"]
     registration_frame = registration["frame_index"]
     target_id = annotation_file["target_person_id"]
-    registration_status = {"status": "pending", "frame_index": registration_frame,
+    registration_status = {"status": "not_started", "frame_index": registration_frame,
                            "iou_threshold": REGISTRATION_IOU, "track_id": None, "reason": None}
     locked_track_id = None
+    target_identity_id = None
     pending_lock_track_id = None
     pending_registration_box = None
     predictions = []
@@ -346,12 +352,14 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
                         registration_status.update(status="failed", reason="TRACK_GONE")
                     elif any(box.track_id == pending_lock_track_id for box in output_boxes):
                         try:
-                            session.lock(pending_lock_track_id, frame_index, "lock")
+                            lock_result = session.lock(pending_lock_track_id, frame_index, "lock")
+                            target_identity_id = lock_result.get("identity_id")
                             registration_status.update(status="registered", track_id=pending_lock_track_id,
                                                        effective_frame_index=frame_index, reason=None,
                                                        warmup_delay_seconds=round(
                                                            timestamp - registration_status["requested_time_seconds"], 6))
-                            output_boxes = [box.model_copy(update={"state": "locked", "identity_id": "ID-01"})
+                            output_boxes = [box.model_copy(update={"state": "locked",
+                                                                  "identity_id": target_identity_id})
                                             if box.track_id == pending_lock_track_id else box
                                             for box in output_boxes]
                             pending_lock_track_id = None
@@ -364,7 +372,8 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
                 "frame_index": frame_index,
                 "video_time_seconds": round(timestamp, 6),
                 "processing_ms": round(processing_ms, 3),
-                "boxes": [box_record(box, locked_track_id, args.variant == "bytetrack")
+                "boxes": [box_record(box, locked_track_id, args.variant == "bytetrack",
+                                     target_identity_id=target_identity_id)
                           for box in output_boxes],
             })
             frame_index += 1

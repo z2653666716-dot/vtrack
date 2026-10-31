@@ -399,6 +399,9 @@ class VideoReviewApp:
         people.append({"person_id": person_id, "bbox_xyxy": [x1, y1, x2, y2]})
         if self.is_target_var.get():
             self.target_person_id = person_id
+            # 人工已为目标编号画框，目标在本帧可见；同步状态避免导出时漏计可见样本。
+            self.visibility_var.set("visible")
+            self.annotations[self.frame_index]["target_visibility"] = "visible"
         self._refresh_people_list()
         self._update_position()
         self._render_frame()

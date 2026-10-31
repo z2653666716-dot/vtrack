@@ -8,7 +8,17 @@ import math
 
 import pytest
 
-from app.evaluation import FrameObservation, evaluate_reentry, summarize_frames, validate_frames
+from app.evaluation import (FrameObservation, effective_target_visibility,
+                            evaluate_reentry, summarize_frames, validate_frames)
+
+
+def test_target_box_resolves_unknown_visibility_but_empty_unknown_stays_unknown() -> None:
+    """明确画出的目标人工框代表目标在场；没有目标框的 unknown 仍应排除。"""
+    assert effective_target_visibility(
+        "unknown", [{"person_id": "person-1", "bbox_xyxy": [0, 0, 1, 1]}], "person-1"
+    ) == (True, True)
+    assert effective_target_visibility("unknown", [], "person-1") == (None, False)
+    assert effective_target_visibility("absent", [], "person-1") == (False, False)
 
 
 def observation(

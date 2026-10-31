@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 
 from app.config import AppConfig, load_config
 from app.detector import Detector
+from app.evaluation import effective_target_visibility
 from app.hybrid_session import HybridSession
 from app.pipeline import Pipeline
 from app.schemas import Box
@@ -97,6 +98,7 @@ def load_annotations(path: Path, video_path: Path) -> tuple[dict, dict[int, dict
         raise ValueError("目标登记编号与视频目标编号不一致")
 
     annotations = {}
+    inferred_visible_frames = 0
     for row in payload.get("annotations", []):
         if not isinstance(row, dict):
             raise ValueError("每条逐帧标注必须是 JSON 对象")
@@ -125,7 +127,15 @@ def load_annotations(path: Path, video_path: Path) -> tuple[dict, dict[int, dict
                 raise ValueError(f"第 {frame_index} 帧人物 {person_id} 的边界框格式错误")
         if row["target_visibility"] == "visible" and target_id not in seen_people:
             raise ValueError(f"第 {frame_index} 帧目标可见但缺少目标人工框")
+        effective_visibility, inferred = effective_target_visibility(
+            row["target_visibility"], people, target_id)
+        if inferred:
+            row["target_visibility"] = "visible"
+            inferred_visible_frames += 1
         annotations[frame_index] = row
+
+    # 记录修正数量供报告解释；文件 SHA 仍基于用户原始导出的 JSON 计算。
+    payload["_visibility_inferred_frames"] = inferred_visible_frames
 
     registration_frame = registration.get("frame_index")
     if type(registration_frame) is not int or registration_frame not in annotations:
@@ -159,10 +169,11 @@ def iou(first: tuple[float, ...] | list[float], second: tuple[float, ...] | list
     return intersection / max(first_area + second_area - intersection, 1e-12)
 
 
-def match_registration(boxes: list[Box], target_box: list[float]) -> tuple[Box | None, float | None]:
+def match_registration(boxes: list[Box], target_box: list[float],
+                       minimum_iou: float = REGISTRATION_IOU) -> tuple[Box | None, float | None]:
     """找与人工目标框 IoU 最大的系统框；低重叠或近似并列时拒绝猜测。"""
     ranked = sorted(((iou(box.xyxy, target_box), box) for box in boxes), key=lambda pair: pair[0], reverse=True)
-    if not ranked or ranked[0][0] < REGISTRATION_IOU:
+    if not ranked or ranked[0][0] < minimum_iou:
         return None, ranked[0][0] if ranked else None
     if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.05:
         return None, ranked[0][0]
@@ -242,6 +253,8 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
     registration_status = {"status": "pending", "frame_index": registration_frame,
                            "iou_threshold": REGISTRATION_IOU, "track_id": None, "reason": None}
     locked_track_id = None
+    pending_lock_track_id = None
+    pending_registration_box = None
     predictions = []
     previous_timestamp = -1.0
     frame_index = 0
@@ -269,26 +282,83 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
             output_boxes = result.boxes
 
             if frame_index == registration_frame:
+                registration_status["requested_time_seconds"] = timestamp
                 human_frame = annotations[registration_frame]
                 target_box = next(person["bbox_xyxy"] for person in human_frame["people"]
                                   if person["person_id"] == target_id)
                 selected, overlap_score = match_registration(output_boxes, target_box)
                 registration_status["best_iou"] = round(overlap_score, 6) if overlap_score is not None else None
-                if selected is None or selected.track_id is None:
+                if selected is None:
                     registration_status.update(status="failed", reason="no_unique_detection_match")
                 elif isinstance(session, Tracker):
-                    locked_track_id = selected.track_id
-                    registration_status.update(status="registered", track_id=locked_track_id)
-                else:
-                    try:
-                        session.lock(selected.track_id, frame_index, "lock")
+                    if selected.track_id is None:
+                        pending_registration_box = list(selected.xyxy)
+                        registration_status.update(status="pending", reason="waiting_for_track_id",
+                                                   anchor_iou_threshold=0.3)
+                    else:
                         locked_track_id = selected.track_id
-                        registration_status.update(status="registered", track_id=locked_track_id)
-                        # 当前帧的 FrameResult 已在登记操作前返回，所以同步修正该帧显示状态。
-                        output_boxes = [box.model_copy(update={"state": "locked", "identity_id": "ID-01"})
-                                        if box.track_id == locked_track_id else box for box in output_boxes]
-                    except SessionError as error:
-                        registration_status.update(status="failed", reason=error.code)
+                        registration_status.update(status="registered", track_id=locked_track_id,
+                                                   effective_frame_index=frame_index, reason=None)
+                else:
+                    # 某些跟踪器首帧只输出候选框；先保存框位置，待它产生稳定轨迹号。
+                    if selected.track_id is None:
+                        pending_registration_box = list(selected.xyxy)
+                        registration_status.update(status="pending", reason="waiting_for_track_id",
+                                                   anchor_iou_threshold=0.3)
+                    else:
+                        pending_lock_track_id = selected.track_id
+                        locked_track_id = selected.track_id
+                        registration_status.update(status="pending", track_id=locked_track_id,
+                                                   reason="waiting_for_track_warmup")
+
+            # 登记操作先固定人工目标，再等待跟踪器生成轨迹号或满足身份特征预热条件。
+            if registration_status["status"] == "pending":
+                if pending_registration_box is not None and pending_lock_track_id is None:
+                    anchor_box, anchor_iou = match_registration(
+                        output_boxes, pending_registration_box, minimum_iou=0.3)
+                    if anchor_box is not None:
+                        pending_registration_box = list(anchor_box.xyxy)
+                        if anchor_box.track_id is not None:
+                            pending_lock_track_id = anchor_box.track_id
+                            locked_track_id = anchor_box.track_id
+                            registration_status.update(track_id=locked_track_id,
+                                                       reason="waiting_for_track_warmup",
+                                                       anchor_best_iou=round(anchor_iou, 6))
+
+                if (timestamp - registration_status["requested_time_seconds"] > 2.0
+                        and pending_lock_track_id is None):
+                    pending_registration_box = None
+                    registration_status.update(status="failed", reason="TRACK_NOT_INITIALIZED")
+                elif (timestamp - registration_status["requested_time_seconds"] > 2.0
+                      and pending_lock_track_id is not None
+                      and isinstance(session, VideoSession)):
+                    pending_lock_track_id = None
+                    registration_status.update(status="failed", reason="REID_NOT_WARM")
+                elif pending_lock_track_id is not None and isinstance(session, Tracker):
+                    registration_status.update(status="registered", effective_frame_index=frame_index,
+                                               warmup_delay_seconds=round(
+                                                   timestamp - registration_status["requested_time_seconds"], 6),
+                                               reason=None)
+                    pending_lock_track_id = None
+                elif pending_lock_track_id is not None and isinstance(session, VideoSession):
+                    if pending_lock_track_id not in session.observations:
+                        pending_lock_track_id = None
+                        registration_status.update(status="failed", reason="TRACK_GONE")
+                    elif any(box.track_id == pending_lock_track_id for box in output_boxes):
+                        try:
+                            session.lock(pending_lock_track_id, frame_index, "lock")
+                            registration_status.update(status="registered", track_id=pending_lock_track_id,
+                                                       effective_frame_index=frame_index, reason=None,
+                                                       warmup_delay_seconds=round(
+                                                           timestamp - registration_status["requested_time_seconds"], 6))
+                            output_boxes = [box.model_copy(update={"state": "locked", "identity_id": "ID-01"})
+                                            if box.track_id == pending_lock_track_id else box
+                                            for box in output_boxes]
+                            pending_lock_track_id = None
+                        except SessionError as error:
+                            if error.code != "REID_NOT_WARM":
+                                pending_lock_track_id = None
+                                registration_status.update(status="failed", reason=error.code)
 
             predictions.append({
                 "frame_index": frame_index,
@@ -331,6 +401,8 @@ async def run_replay(args: argparse.Namespace, annotation_file: dict, annotation
                        "reid_confirm_frames": config.reid_confirm_frames},
             "registration_iou": REGISTRATION_IOU,
             "annotation_sha256": sha256_file(args.annotations),
+            "visibility_inferred_from_target_boxes": annotation_file.get(
+                "_visibility_inferred_frames", 0),
             "elapsed_computation_seconds": round(perf_counter() - started_all, 3),
             "prediction_samples": len(predictions),
         },

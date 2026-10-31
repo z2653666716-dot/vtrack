@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.evaluation import FrameObservation, evaluate_reentry, summarize_frames
+from app.evaluation import (FrameObservation, effective_target_visibility,
+                            evaluate_reentry, summarize_frames)
 
 
 DEFAULT_IOU = 0.5
@@ -107,7 +108,9 @@ def classify_binding(annotation: dict, prediction: dict, target_id: str,
 
 def target_detection_iou(annotation: dict, prediction: dict, target_id: str) -> float | None:
     """返回预测中最贴近人工目标框的检测 IoU；不要求该框已经绑定身份。"""
-    if annotation["target_visibility"] != "visible":
+    visibility, _inferred = effective_target_visibility(
+        annotation["target_visibility"], annotation.get("people", []), target_id)
+    if visibility is not True:
         return None
     target = next(person["bbox_xyxy"] for person in annotation["people"]
                   if person["person_id"] == target_id)
@@ -188,14 +191,19 @@ def evaluate_variant(annotation: dict, item: dict, iou_threshold: float) -> dict
     visible_unbound = 0
     visible_wrong = 0
     visible_unmatched = 0
+    inferred_visibility = 0
 
     for human_frame in sorted(annotation.get("annotations", []), key=lambda row: row["frame_index"]):
         frame_index = human_frame["frame_index"]
         prediction = prediction_map.get(frame_index)
         if prediction is None:
             raise ValueError(f"{item['payload']['variant']} 缺少已标注第 {frame_index} 帧的系统输出")
-        visibility = {"visible": True, "absent": False, "unknown": None}[human_frame["target_visibility"]]
-        binding, detail = classify_binding(human_frame, prediction, target_id, iou_threshold)
+        visibility, inferred = effective_target_visibility(
+            human_frame["target_visibility"], human_frame.get("people", []), target_id)
+        inferred_visibility += inferred
+        effective_frame = ({**human_frame, "target_visibility": "visible"}
+                           if inferred else human_frame)
+        binding, detail = classify_binding(effective_frame, prediction, target_id, iou_threshold)
         processing_ms = prediction.get("processing_ms")
         observations.append(FrameObservation(
             frame_index=frame_index,
@@ -204,7 +212,7 @@ def evaluate_variant(annotation: dict, item: dict, iou_threshold: float) -> dict
             binding=binding,
             processing_ms=processing_ms,
         ))
-        detection_iou = target_detection_iou(human_frame, prediction, target_id)
+        detection_iou = target_detection_iou(effective_frame, prediction, target_id)
         if visibility is True:
             target_visible_count += 1
             target_ious.append(detection_iou)
@@ -219,7 +227,8 @@ def evaluate_variant(annotation: dict, item: dict, iou_threshold: float) -> dict
             "scene": human_frame.get("scene", "unspecified"),
             "frame_index": frame_index,
             "video_time_seconds": human_frame["video_time_seconds"],
-            "target_visibility": human_frame["target_visibility"],
+            "target_visibility": "visible" if inferred else human_frame["target_visibility"],
+            "visibility_inferred_from_target_box": inferred,
             "binding": binding or "unbound_or_unknown",
             "matched_person_id": detail["matched_person_id"],
             "binding_iou": detail["binding_iou"],
@@ -243,6 +252,7 @@ def evaluate_variant(annotation: dict, item: dict, iou_threshold: float) -> dict
         "visible_wrong_person_frames": visible_wrong,
         "visible_unmatched_binding_frames": visible_unmatched,
         "multiple_bound_boxes_frames": duplicate_bound_frames,
+        "visibility_inferred_from_target_boxes": inferred_visibility,
     })
 
     reentry_results = []
@@ -308,6 +318,7 @@ def markdown_report(report: dict) -> str:
         "",
         f"视频摘要：`{report['video_sha256']}`",
         f"人工标注摘要：`{report['annotation_sha256']}`",
+        f"可见状态修正：{report.get('visibility_inferred_from_target_boxes', 0)} 帧根据人工标注的目标人物框从 unknown 计为 visible。",
         f"框匹配主门槛：IoU ≥ {report['iou_threshold']:.2f}；无法匹配或存在多人歧义的框不计作身份错误。",
         "",
         "| 方案 | 目标正确覆盖率 | 匹配绑定框身份正确率 | 匹配绑定框错绑率 | 目标检测召回率 | 可见目标帧 | 错绑帧 | 未绑定帧 | 无法对应绑定框 | 重入成功/可评 | 恢复/确认延迟(s) | 平均处理耗时(ms) | 耗时样本 |",
@@ -433,6 +444,11 @@ def main() -> int:
             "annotation_sha256": sha256_file(args.annotations),
             "iou_threshold": args.iou,
             "ambiguity_margin": AMBIGUITY_MARGIN,
+            "visibility_inferred_from_target_boxes": sum(
+                row.get("target_visibility") == "unknown"
+                and any(person.get("person_id") == annotation["target_person_id"]
+                        for person in row.get("people", []))
+                for row in annotation.get("annotations", [])),
             "variants": results,
             "scenes": scenes,
             "iou_sensitivity": sensitivity,

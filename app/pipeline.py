@@ -214,16 +214,20 @@ class Pipeline:
                 if isinstance(tracker, HybridSession):
                     self.prepare_hybrid(tracker)
                     detections = tracker.prepare_frame(frame, detections)
-                    boxes = tracker.update(detections, width, height, frame)
+                    tracker.update(detections, width, height, frame)
+                    boxes = tracker.process(frame, seq)
+                elif isinstance(tracker, VideoSession):
+                    # BoT-SORT 的外观关联需要当前图像与 OSNet 编码器，必须在更新轨迹时传入。
+                    # 先完成这一帧的轨迹关联，再由会话依据关联结果判断目标身份。
+                    if self.extractor is None:
+                        self.extractor = FeatureExtractor(self.config)
+                    tracker.extractor = self.extractor
+                    tracker.update(detections, width, height, frame)
+                    boxes = tracker.process(frame, seq)
                 else:
                     boxes = tracker.update(detections, width, height) if tracker is not None else [
                     Box.from_detection(item, width, height) for item in detections
                     ]
-                if isinstance(tracker, VideoSession):
-                    if self.extractor is None:
-                        self.extractor = FeatureExtractor(self.config)
-                    tracker.extractor = self.extractor
-                    boxes = tracker.process(frame, seq)
                 result = FrameResult(seq=seq, boxes=boxes,
                                      session_id=getattr(tracker, "token", None),
                                      identities=tracker.summaries() if isinstance(tracker, VideoSession) else [],

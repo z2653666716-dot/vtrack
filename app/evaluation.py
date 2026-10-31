@@ -33,6 +33,27 @@ class FrameObservation:
     processing_ms: float | None = None
 
 
+def effective_target_visibility(
+    visibility: str,
+    people: Sequence[dict],
+    target_person_id: str,
+) -> tuple[bool | None, bool]:
+    """把人工可见性文字转为评测值，并修正常见的“目标框已画但仍为 unknown”。
+
+    输入为人工标注状态、该帧人物框列表和目标人物编号；输出为 True/False/None
+    及是否由明确的目标人物框推断为可见。目标框本身是人工确认目标出现在画面中的证据。
+    """
+    if visibility == "unknown" and any(
+        isinstance(person, dict) and person.get("person_id") == target_person_id
+        for person in people
+    ):
+        return True, True
+    values = {"visible": True, "absent": False, "unknown": None}
+    if visibility not in values:
+        raise ValueError("目标可见状态只能是 visible、absent 或 unknown")
+    return values[visibility], False
+
+
 def validate_frames(frames: Sequence[FrameObservation]) -> None:
     """检查逐帧输入；成功无返回值，错误抛出 ValueError。
 

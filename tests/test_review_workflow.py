@@ -1,6 +1,10 @@
 """离线视频复核流程测试：问题备注与定量评测标注彼此独立。"""
 
-from scripts.review_video import build_review_notes_payload, choose_automatic_registration
+from scripts.review_video import (
+    build_review_notes_payload,
+    choose_automatic_registration,
+    prediction_binding_label,
+)
 
 
 def test_review_notes_export_does_not_require_boxes_or_registration():
@@ -41,3 +45,10 @@ def test_registration_is_automatically_the_earliest_target_box():
 
     assert choose_automatic_registration(annotations, "person-1")["frame_index"] == 4
     assert choose_automatic_registration(annotations, "missing") is None
+
+
+def test_binding_label_uses_target_binding_flag_not_locked_state():
+    """ByteTrack state=none 也可能已绑定；绿色绑定字段才是目标判断依据。"""
+    assert prediction_binding_label({"bound_to_target": True, "state": "none"}) == "已绑定目标"
+    assert prediction_binding_label({"bound_to_target": False, "state": "locked"}) == "已锁定但非登记目标"
+    assert prediction_binding_label({"bound_to_target": False, "state": "candidate"}) == "候选中"

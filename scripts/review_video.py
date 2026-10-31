@@ -74,6 +74,18 @@ def build_review_notes_payload(video: dict, prediction: dict | None,
     }
 
 
+def prediction_binding_label(box_data: dict) -> str:
+    """把机器状态翻译成复核者容易看懂的绑定文字。
+
+    输入是一条预测框记录；输出明确说明它是否绑定到登记目标。
+    `state=locked` 是身份模块状态，不能替代 `bound_to_target` 判断。
+    """
+    if box_data.get("bound_to_target") is True:
+        return "已绑定目标"
+    states = {"candidate": "候选中", "locked": "已锁定但非登记目标", "none": "未绑定目标"}
+    return states.get(box_data.get("state"), "未绑定目标")
+
+
 class VideoReviewApp:
     """管理本地视频、播放位置、人工框和导出标注。
 
@@ -409,7 +421,8 @@ class VideoReviewApp:
             color = "#2ecc71" if box_data.get("bound_to_target") is True else "#55c7ec"
             box = (left + x1 * shown_width, top + y1 * shown_height,
                    left + x2 * shown_width, top + y2 * shown_height)
-            label = f"预测 track={box_data.get('track_id')} {box_data.get('state', '')}"
+            label = (f"预测 track={box_data.get('track_id')} "
+                     f"{prediction_binding_label(box_data)}")
             self.canvas.create_rectangle(*box, outline=color, width=2, dash=(5, 3))
             self.canvas.create_text(box[0] + 3, box[1] + 3, text=label, fill=color, anchor="nw")
         if self.drag_start is not None:

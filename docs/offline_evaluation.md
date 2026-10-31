@@ -113,17 +113,20 @@ $video = "resources\你的测试视频.mp4"
 
 `hybrid_b0` 使用现有追加模板逻辑；`hybrid_b1` 保留初始锚点并用固定权重 EMA 更新身体动态模板；`hybrid_b2` 保持 B1 的资格条件与时机，只令 EMA 权重乘以观测质量分数。质量分数由人物裁剪尺寸、清晰度、画面边缘风险和与旁人框重叠构成，只用于降低低质量观测的更新权重，不是身份置信度。
 
-准备 MOT17 训练序列时，视频从 MOTChallenge 官方序列下载项取得，标签使用 `MOT17Labels.zip`。原始视频、标签和生成的完整帧级标注只保存在本地 `work/` 与被忽略的 `outputs/`，不可提交到 Git、源码包或公开报告仓库。MOT17 官方条款为 CC BY-NC-SA 3.0；引用时应注明 MOTChallenge 及其论文，任何对数据本身的再分发都需遵守原条款。MOT17-05/09 已用于开发；本项目记录里未发现 02/04/10/11/13 被用于调参，因此本次把这些完整序列作为项目内冻结保留集。它们仍属于 MOT17 training split，**不是官方 test split，也不证明跨数据集泛化**。
+准备 MOT17 训练序列时，视频从 [MOTChallenge 官方序列归档](https://motchallenge.net/data/MOT17/) 取得，标签使用 `MOT17Labels.zip`。原始视频、标签和生成的完整帧级标注只保存在本地 `work/` 与被忽略的 `outputs/`，不可提交到 Git、源码包或公开报告仓库。MOT17 官方条款为 CC BY-NC-SA 3.0；引用时应注明 MOTChallenge 及其论文，任何对数据本身的再分发都需遵守原条款。MOT17-05/09 已用于开发；本项目记录里未发现 02/04/10/11/13 被用于调参，因此本次把这些完整序列作为项目内冻结保留集。它们仍属于 MOT17 training split，**不是官方 test split，也不证明跨数据集泛化**。官方页面已将 MOTChallenge 在线评测标为关闭；公开 test split 没有可用于本流程的 GT。
+
+每段视频固定选一条 GT 行人轨迹：在 `mark>0`、`class=1`、`visibility>0` 的记录中，选可见标注帧数最多的 track ID，并列取较小 ID。该规则只读人工 GT，不看任何方案预测；选出的 ID 和自动登记帧写入标注文件。当前五条序列对应的 ID 为：02→19、04→1、10→4、11→1、13→39。一个视频只选一人，因此结果主要用于方案的初步保留评估，不能把帧数误当成多目标数量或独立样本数。
 
 先固定代码和参数，再对同一视频分别运行三种方案。登记帧由标注工具自动取目标首次满足条件的可见帧；所有方案使用同一检测器、视频帧、目标 ID、模型与配置。不要在查看保留结果后调整阈值或质量映射；如需修改，应另留新的未见视频。
 
 ```powershell
 $python = ".\envs\vitrack\python.exe"
 $sequence = "02"
+$targetTrack = 19
 $video = "work\public_datasets\mot17_holdout\MOT17-$sequence-DPM-raw.mp4"
 $labels = "work\public_datasets\mot17_holdout\MOT17Labels.zip"
 $annotations = "outputs\evaluation\MOT17-$sequence\MOT17-$sequence-DPM_visibility_annotations.json"
-& $python -X utf8 scripts/prepare_mot17_annotations.py --labels-zip $labels --video $video --sequence $sequence --output $annotations
+& $python -X utf8 scripts/prepare_mot17_annotations.py --labels-zip $labels --video $video --sequence $sequence --target-track-id $targetTrack --output $annotations
 foreach ($variant in @("hybrid_b0", "hybrid_b1", "hybrid_b2")) {
   & $python -X utf8 scripts/evaluate_video.py --video $video --annotations $annotations --variant $variant --output "outputs\evaluation\quality_template\MOT17-$sequence`_$variant`_predictions.json"
 }

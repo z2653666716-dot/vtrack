@@ -75,9 +75,10 @@ class Pipeline:
         self.recommended_max_side = self.config.max_side
         self.slow_frames = 0
 
-    def create_tracker(self) -> VideoSession:
-        """无输入，输出新的会话跟踪器；路由为每条浏览器连接或一次 IP 采集创建一个。"""
-        session = HybridSession(self.config) if self.config.identity_mode == "hybrid" else VideoSession(self.config)
+    def create_tracker(self, clock=None) -> VideoSession:
+        """创建新视频会话；离线回放可传视频时钟，在线调用保留真实系统时钟。"""
+        session = (HybridSession(self.config, clock=clock) if self.config.identity_mode == "hybrid"
+                   else VideoSession(self.config, clock=clock))
         self.sessions[session.token] = session
         return session
 

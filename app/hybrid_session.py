@@ -43,8 +43,8 @@ class HybridObservation(Observation):
 class HybridSession(VideoSession):
     """由Pipeline串行调用；身份重入需要新证据，短时连续跟踪不再要求复现登记姿势。"""
 
-    def __init__(self, config, extractor=None, face_encoder=None):
-        super().__init__(config, extractor)
+    def __init__(self, config, extractor=None, face_encoder=None, clock=None):
+        super().__init__(config, extractor, clock=clock)
         self.face_encoder = face_encoder
         self.face_templates, self.body_valid, self.current_faces = {}, {}, {}
         self.current_body_features = {}
@@ -91,7 +91,7 @@ class HybridSession(VideoSession):
         for box in boxes:
             if box.track_id is not None:
                 track = self.observations[box.track_id]
-                old, now = previous.get(box.track_id), monotonic()
+                old, now = previous.get(box.track_id), self.clock()
                 gap = self.frame_count - old["last_frame"] - 1 if old else 0
                 track.motion_ok = bool(old and old["last_box"] and gap <= 2 and
                                        overlap(box.xyxy, old["last_box"]) > .15 and
@@ -141,10 +141,10 @@ class HybridSession(VideoSession):
             if continuing and track.motion_ok and not crowded:
                 if track_id in self.head_only_ids and sample.reason == "FACE_PROFILE":
                     mode, reason = "continuity", "CONTINUOUS_PROFILE_TRACK"
-                elif (track_id in self.head_only_ids or body_score >= self.config.body_hold_threshold) and monotonic() - track.last_verified <= self.config.identity_hold_seconds:
+                elif (track_id in self.head_only_ids or body_score >= self.config.body_hold_threshold) and self.clock() - track.last_verified <= self.config.identity_hold_seconds:
                     mode, reason = "continuity", "SHORT_FACE_UNCERTAINTY"
         elif (continuing and track.motion_ok and crowded and body_unique and
-              monotonic() - track.last_verified <= self.config.identity_hold_seconds):
+              self.clock() - track.last_verified <= self.config.identity_hold_seconds):
             # 人脸归属不清时不强行借用另一张脸；原轨迹的身体还明显领先旁人，只允许有限等待。
             # continuity不会刷新last_verified，因此不能靠同一份身体依据无限延长遮挡等待。
             mode, reason = "continuity", "SHORT_UNIQUE_BODY_OVERLAP"
@@ -158,7 +158,7 @@ class HybridSession(VideoSession):
                 mode, reason = "body", "BODY_CONFIRMED"
             elif body_score >= self.config.body_hold_threshold and body_score - negative >= self.config.reid_margin:
                 mode, reason = "continuity", "CONTINUOUS_BODY_TRACK"
-            elif face_score is None and monotonic() - track.last_verified <= self.config.identity_hold_seconds:
+            elif face_score is None and self.clock() - track.last_verified <= self.config.identity_hold_seconds:
                 mode, reason = "continuity", "SHORT_OBSERVATION_GAP"
         elif not continuing and not templates and body_positive and not crowded:
             mode, reason = "body", "BODY_CONFIRMED"
@@ -202,7 +202,7 @@ class HybridSession(VideoSession):
         track = self.observations[key]
         sample = self.current_faces.get(key)
         if check["mode"] in {"face", "body"}:
-            track.last_verified = monotonic()
+            track.last_verified = self.clock()
         if check["mode"] == "face":
             if feature is not None:
                 if not self.body_valid.get(identity_id):
@@ -250,7 +250,7 @@ class HybridSession(VideoSession):
         process先完成全局候选竞争再调用。最多容忍连续两帧中性缺失，且仍受最近证据时间、
         总确认窗口和运动连续性约束；明确异人脸、跨人歧义或另一候选胜出会直接清零。
         """
-        track, now = self.observations[track_id], monotonic()
+        track, now = self.observations[track_id], self.clock()
         window = max(self.config.reid_confirm_frames * 2, self.config.reid_confirm_frames + 2)
         if track.candidate is not None and self.frame_count - track.candidate_start_frame >= window:
             self.reset_candidate(track_id, "CONFIRMATION_WINDOW_EXPIRED")
@@ -399,7 +399,7 @@ class HybridSession(VideoSession):
         self.boxes = output
         online = {box.identity_id for box in output if box.identity_id}
         self.events.extend({"type": "event", "name": "lost", "identity_id": key} for key in self.was_online - online)
-        self.was_online, self.updated_at = online, monotonic()
+        self.was_online, self.updated_at = online, self.clock()
         self.write_events()
         self.recorder.write(frame, output, seq, self.events)
         return output
@@ -427,7 +427,7 @@ class HybridSession(VideoSession):
             if sample is not None and sample.feature is not None:
                 self.face_templates[identity_id] = [sample.feature.copy()]
             self.body_valid[identity_id] = track_id not in self.head_only_ids
-            self.observations[track_id].last_verified = monotonic()
+            self.observations[track_id].last_verified = self.clock()
             self.observations[track_id].body_learning_allowed = self.body_valid[identity_id]
         return reply
 

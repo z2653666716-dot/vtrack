@@ -137,7 +137,7 @@ def test_competing_faces_and_elapsed_gap_cannot_use_old_progress(monkeypatch):
     previous = session.observations[target].candidate_last_positive
     session.face_encoder.target = None
     session.face_encoder.reason = "FACE_BLURRED"
-    monkeypatch.setattr("app.hybrid_session.monotonic", lambda: previous + 3)
+    session.clock = lambda: previous + 3
     assert all(box.state != "locked" for box in advance(session, frame, 14))
     assert session.observations[target].candidate_hits == 0
 
@@ -186,7 +186,7 @@ def test_unique_body_can_wait_briefly_during_face_overlap(monkeypatch):
     result = advance(session, frame, 7)
     assert next(box for box in result if box.track_id == target).state == "locked"
     assert session.observations[target].last_verified == verified
-    monkeypatch.setattr("app.hybrid_session.monotonic", lambda: verified + 3)
+    session.clock = lambda: verified + 3
     assert all(box.state != "locked" for box in advance(session, frame, 8))
 
 

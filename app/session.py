@@ -42,8 +42,10 @@ class Observation:
 class VideoSession:
     """输入检测、帧与控制请求，输出带身份状态的框、身份条和事件。"""
 
-    def __init__(self, config, extractor=None):
+    def __init__(self, config, extractor=None, clock=None):
         self.config, self.extractor = config, extractor
+        # 在线服务继续使用真实 monotonic 时钟；离线回放可注入按视频时间推进的时钟。
+        self.clock = clock or monotonic
         self.tracker = Tracker(config)
         self.token = token_urlsafe(32)
         self.gallery = Gallery(config)
@@ -51,7 +53,7 @@ class VideoSession:
         self.boxes = []
         self.seq = -1
         self.frame_count = 0
-        self.updated_at = monotonic()
+        self.updated_at = self.clock()
         self.frame = None
         self.size = None
         self.events = []
@@ -74,7 +76,7 @@ class VideoSession:
 
     def record_interaction(self, details):
         """接收接口已验证的枚举/数字，每会话每秒最多10条；不记录用户输入的任意文字。"""
-        now = monotonic()
+        now = self.clock()
         if len(self._interaction_times) == 10 and now - self._interaction_times[0] < 1:
             return {"ok": True, "recorded": False}
         self._interaction_times.append(now)
@@ -96,7 +98,7 @@ class VideoSession:
             self.size = (width, height)
         self.boxes = self.tracker.update(detections, width, height, image=frame, extractor=self.extractor) if frame is not None else self.tracker.update(detections, width, height)
         self.frame_count += 1
-        self.updated_at = monotonic()
+        self.updated_at = self.clock()
         for box in self.boxes:
             if box.track_id is None:
                 continue
@@ -229,7 +231,7 @@ class VideoSession:
                            for key in sorted(self.was_online - online))
         self.was_online = online
         # 冷启动特征提取可能耗时，过期判断以结果完成时间为准，不从推理开始计时。
-        self.updated_at = monotonic()
+        self.updated_at = self.clock()
         self.write_events()
         self.recorder.write(frame, output, seq, self.events)
         return output
@@ -300,14 +302,14 @@ class VideoSession:
     def lock(self, track_id, seq, action='toggle'):
         """输入轨迹号、帧号和lock/unlock/toggle，输出明确的操作结果；同时只保留一个目标。"""
         self.diagnostic("lock_requested", track_id=track_id, client_seq=seq, action=action,
-                        frame_age_ms=round((monotonic() - self.updated_at) * 1000, 2))
+                        frame_age_ms=round((self.clock() - self.updated_at) * 1000, 2))
         def reject(code, message):
             """所有业务拒绝同时留下受控错误码，再由HTTP接口返回中文提示。"""
             self.diagnostic("lock_rejected", track_id=track_id, code=code, action=action)
             raise SessionError(code, message)
 
         box = next((item for item in self.boxes if item.track_id == track_id), None)
-        if box is None or monotonic() - self.updated_at > 3 or seq > self.seq or self.seq - seq > 30:
+        if box is None or self.clock() - self.updated_at > 3 or seq > self.seq or self.seq - seq > 30:
             reject('TRACK_GONE', '目标已离开画面或画面已过期，请重新选择')
         if box.cls != 0:
             reject('UNSUPPORTED_TARGET', '身份锁定目前支持人物，请选择 person 框')
